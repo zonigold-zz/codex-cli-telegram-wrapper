@@ -9,15 +9,18 @@ bridge script, one example environment file, and this README.
 The bridge is designed for a single trusted operator. It is not a multi-user bot
 platform.
 
+
 ## Repository layout
 
 ```text
 codex-cli-telegram-wrapper/
-├─ codex-tg.cmd
-├─ codex_tg_bridge.py
+├─ README.md
+├─ LICENSE
+├─ .gitignore
 ├─ .env.example
-└─ README.md
-```
+├─ codex_tg_bridge.py
+└─ codex-tg.cmd
+```text
 
 ## What it does
 
