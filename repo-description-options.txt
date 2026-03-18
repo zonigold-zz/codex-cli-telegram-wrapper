@@ -1,0 +1,20 @@
+Recommended repository description options
+
+1) codex-cli-telegram-wrapper
+Remote Telegram wrapper for Codex CLI, with live output streaming and simple Windows setup.
+
+2) Slightly more technical
+Run Codex CLI from Telegram and stream terminal output back to your chat in near real time.
+
+3) More discovery-oriented
+A lightweight Telegram bridge for Codex CLI on Windows, designed for simple remote control and easy self-hosting.
+
+Suggested topics
+codex-cli
+telegram-bot
+openai
+windows
+python
+automation
+remote-control
+cli-tools
