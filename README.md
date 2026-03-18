@@ -292,8 +292,7 @@ and trust/configure that workspace according to Codex guidance.
 
 ## Recommended `.gitignore`
 
-This repo intentionally stays at four files, so `.gitignore` is not included
-here. At minimum, add this in your own project:
+This repository includes a minimal `.gitignore`. If you adapt this bridge into another project, at minimum keep these entries:
 
 ```gitignore
 .env
