@@ -304,3 +304,7 @@ A webhook-based bot is perfectly valid, but this project chooses long polling fo
 one reason: reproducibility. Anyone can clone it, install two dependencies
 (Codex CLI and `requests`), fill `.env`, and run it locally without needing a
 public server or HTTPS setup.
+
+## License
+
+This repository is released under the MIT License. See `LICENSE`.
