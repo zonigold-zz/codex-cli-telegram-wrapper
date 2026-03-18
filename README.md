@@ -20,6 +20,7 @@ codex-cli-telegram-wrapper/
 ├─ .env.example
 ├─ codex_tg_bridge.py
 └─ codex-tg.cmd
+```
 
 ## What it does
 
