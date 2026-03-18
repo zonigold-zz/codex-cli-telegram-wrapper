@@ -226,6 +226,18 @@ A few implementation choices are deliberate:
 - Old pending Telegram updates are skipped at startup by default to avoid replaying stale prompts.
 - Use `--tg-replay-pending-updates` if you really want to process old pending messages.
 
+## Language, tone, and instruction control
+
+This bridge is language-agnostic. Telegram text is forwarded to Codex as the task prompt, and the bridge can also append a persistent suffix with `CODEX_TG_PROMPT_SUFFIX`.
+
+### Fastest option: use `CODEX_TG_PROMPT_SUFFIX`
+
+Use this when you want every Telegram message to carry the same language preference.
+
+```env
+CODEX_TG_PROMPT_SUFFIX=Always reply in Korean unless I explicitly ask for English. Keep source code, filenames, shell commands, Git messages, and code comments in English unless I explicitly ask otherwise. When summarizing changes, explain them briefly in Korean first.
+```
+
 ## Security notes
 
 This bridge can trigger a local coding agent on your machine. Treat it as a
