@@ -422,34 +422,25 @@ class LiveTail:
             self._dirty = True
 
     def _status_title(self) -> str:
-        mapping = {
-            "starting": "[Codex starting]",
-            "running": "[Codex running]",
-            "thinking": "[Codex thinking]",
-            "done": "[Codex done]",
-            "failed": "[Codex failed]",
-        }
-        return mapping.get(self.status, "[Codex]")
+        """Return a simplified three-state title for the live Telegram message."""
+        if self.status == "starting":
+            return "[Codex Started]"
+        if self.status in {"running", "thinking"}:
+            return "[Codex Working]"
+        if self.status in {"done", "failed"}:
+            return "[Codex done]"
+        return "[Codex Working]"
 
     def _render(self) -> str:
-        """Render the full Telegram text for the rolling live tail message."""
+        """Render the simplified Telegram text for the rolling live tail message."""
         header = self._status_title()
-        elapsed = time.time() - self.started_at
-
-        meta_lines = [
-            f"Status: {self.status}",
-            f"Elapsed: {elapsed:.1f}s",
-        ]
-        if self.codex_session_id:
-            meta_lines.append(f"Session: {self.codex_session_id}")
 
         body_lines = list(self._lines)
         if not body_lines:
             body_lines = ["(No logs yet.)"]
 
-        meta_block = "\n".join(meta_lines)
         body_block = "\n".join(body_lines)
-        text = f"{header}\n{meta_block}\n\n{body_block}"
+        text = f"{header}\n\n{body_block}"
 
         if len(text) <= TELEGRAM_TEXT_LIMIT:
             return text
@@ -460,12 +451,12 @@ class LiveTail:
         trimmed_lines = body_lines[:]
         while trimmed_lines:
             body_block = "\n".join(trimmed_lines)
-            text = f"{header}\n{meta_block}\n\n{body_block}"
+            text = f"{header}\n\n{body_block}"
             if len(text) <= TELEGRAM_TEXT_LIMIT:
                 return text
             trimmed_lines.pop(0)
 
-        return f"{header}\n{meta_block}\n\n(Log truncated.)"
+        return f"{header}\n\n(Log truncated.)"
 
     def _loop(self) -> None:
         while True:
@@ -745,7 +736,6 @@ class CodexRunner:
                         new_session_id = thread_id
                         stats.codex_thread_id = thread_id
                         on_session(thread_id)
-                        on_log(f"[session] started: {thread_id}")
 
                 elif event_type == "turn.started":
                     on_status("thinking")
@@ -840,7 +830,7 @@ class CodexRunner:
 
         final_message: str | None = None
         if stats.agent_messages:
-            final_message = "\n\n".join(stats.agent_messages).strip()
+            final_message = stats.agent_messages[-1].strip()
 
         on_status("done" if error is None else "failed")
         return new_session_id, final_message, stats, error
@@ -1150,38 +1140,18 @@ def main() -> int:
             session_id = new_sid
 
         if error:
-            tail.stop("failed")
-            lines = [
-                "Task failed.",
-                f"Elapsed: {stats.duration_sec:.1f}s",
-            ]
-            if new_sid:
-                lines.append(f"Session: {new_sid}")
-            lines.extend(["", error])
-            outbox.send("\n".join(lines))
+            tail.stop("done")
+            outbox.send(error.strip())
             running_tail = None
             return
 
         tail.stop("done")
 
-        lines = [
-            "Task completed.",
-            f"Elapsed: {stats.duration_sec:.1f}s",
-        ]
-        if new_sid:
-            lines.append(f"Session: {new_sid}")
-
         if final_message:
-            lines.extend(["", "Result:", final_message])
+            outbox.send(final_message)
         else:
-            lines.extend(
-                [
-                    "",
-                    "No final assistant message was captured from the Codex JSON events.",
-                ]
-            )
+            outbox.send("No final assistant message was captured from the Codex JSON events.")
 
-        outbox.send("\n".join(lines))
         running_tail = None
 
     print("[INFO] Listening via getUpdates... (Ctrl+C to stop)")
@@ -1232,7 +1202,7 @@ def main() -> int:
                 outbox.send(
                     "Status\n"
                     f"- Running: {runner.is_running()}\n"
-                    f"- Session: {session_id or '(not started yet)'}\n"
+                    f"- Session reuse: {'active' if session_id else '(not started yet)'}\n"
                     f"- Workdir: {workdir}\n"
                     f"- Topic mode: {'on' if telegram_thread_id is not None else 'off'}"
                 )
