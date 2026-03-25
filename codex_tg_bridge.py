@@ -87,15 +87,22 @@ def redact_secrets(text: str) -> str:
 
     safe = text
 
-    for name in ("TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+    for name in (
+        "TELEGRAM_BOT_TOKEN",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "GOOGLE_API_KEY",
+        "GEMINI_API_KEY",
+        "XAI_API_KEY",
+    ):
         value = os.environ.get(name, "").strip()
         if value:
             safe = safe.replace(value, f"<{name}>")
 
     safe = TELEGRAM_TOKEN_RE.sub("<TELEGRAM_BOT_TOKEN>", safe)
     return safe
-
-
 # -----------------------------------------------------------------------------
 # Small .env loader (no external dependency)
 # -----------------------------------------------------------------------------
@@ -301,6 +308,13 @@ class TelegramClient:
         }
         return self._post("editMessageText", payload, timeout=(5.0, 60.0), use_lock=True)
 
+    def close(self) -> None:
+        for sess in (self.write_session, self.poll_session):
+            try:
+                sess.close()
+            except Exception:
+                pass
+            
 # -----------------------------------------------------------------------------
 # Telegram helpers
 # -----------------------------------------------------------------------------
@@ -315,11 +329,15 @@ def chunk_text(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
 
     while len(remaining) > limit:
         cut = remaining.rfind("\n", 0, limit)
-        if cut < 0:
+        if cut <= 0:
             cut = limit
-        chunks.append(remaining[:cut].rstrip())
-        remaining = remaining[cut:].lstrip()
 
+        part = remaining[:cut].rstrip()
+        if part:
+            chunks.append(part)
+
+        remaining = remaining[cut:].lstrip()
+        
     if remaining.strip():
         chunks.append(remaining.strip())
 
@@ -327,17 +345,7 @@ def chunk_text(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
 
 
 class TelegramOutbox:
-    """Durable outbound message queue.
-
-    Use this for messages that should remain as standalone Telegram messages:
-    - bridge ready notification
-    - help text
-    - final result
-    - final error details
-
-    This queue is intentionally low frequency. High-frequency updates go through
-    `LiveTail`, which edits a single Telegram message in place.
-    """
+    _STOP = object()
 
     def __init__(self, tg: TelegramClient, chat_id: int, thread_id: int | None, min_interval_sec: float) -> None:
         self.tg = tg
@@ -345,24 +353,35 @@ class TelegramOutbox:
         self.thread_id = thread_id
         self.min_interval = max(0.0, float(min_interval_sec))
 
-        self._q: queue.Queue[str] = queue.Queue()
+        self._q: queue.Queue[object] = queue.Queue()
         self._last_sent = 0.0
+        self._closed = threading.Event()
 
-        worker = threading.Thread(target=self._loop, name="telegram-outbox", daemon=True)
-        worker.start()
+        self._worker = threading.Thread(target=self._loop, name="telegram-outbox", daemon=True)
+        self._worker.start()
 
     def send(self, text: str) -> None:
-        """Queue one logical message. It will be chunked automatically if needed."""
-        if not text:
+        if not text or self._closed.is_set():
             return
 
         safe_text = redact_secrets(text)
         for part in chunk_text(safe_text):
             self._q.put(part)
 
+    def close(self, drain_timeout: float = 5.0) -> None:
+        if self._closed.is_set():
+            return
+        self._closed.set()
+        self._q.put(self._STOP)
+        self._worker.join(timeout=drain_timeout)
+
     def _loop(self) -> None:
         while True:
-            text = self._q.get()
+            item = self._q.get()
+            if item is self._STOP:
+                return
+
+            text = str(item)
 
             now = time.time()
             wait = self.min_interval - (now - self._last_sent)
@@ -383,13 +402,18 @@ class TelegramOutbox:
                         time.sleep(max(1, retry_after))
                         continue
 
+                    code = int(payload.get("error_code") or 0)
+                    if code >= 500:
+                        console_print_safe(f"[WARN] Telegram server-side send error: {payload}")
+                        time.sleep(max(1.0, self.min_interval))
+                        continue
+
                     console_print_safe(f"[WARN] Telegram send failed: {payload}")
                     break
                 except Exception as exc:
                     console_print_safe(f"[WARN] Telegram send exception: {exc}")
                     time.sleep(max(1.0, self.min_interval))
                     continue
-
 
 class LiveTail:
     """Single editable Telegram message that shows the latest rolling log lines.
@@ -485,15 +509,21 @@ class LiveTail:
         return "[Codex Working]"
 
     def _render(self) -> str:
-        """Render the simplified Telegram text for the rolling live tail message."""
         header = self._status_title()
+
+        meta_parts: list[str] = []
+        if self.codex_session_id:
+            meta_parts.append(f"session={self.codex_session_id[:12]}")
+        meta_parts.append(f"elapsed={int(time.time() - self.started_at)}s")
+
+        prefix = header if not meta_parts else f"{header}\n{' | '.join(meta_parts)}"
 
         body_lines = list(self._lines)
         if not body_lines:
             body_lines = ["(No logs yet.)"]
 
         body_block = "\n".join(body_lines)
-        text = f"{header}\n\n{body_block}"
+        text = f"{prefix}\n\n{body_block}"
 
         if len(text) <= TELEGRAM_TEXT_LIMIT:
             return text
@@ -560,8 +590,17 @@ class LiveTail:
                     self._last_rendered_text = text
                     return
 
+                code = int(payload.get("error_code") or 0)
+                if code >= 500:
+                    with self._lock:
+                        self._dirty = True
+                    console_print_safe(f"[WARN] Telegram server-side edit error: {payload}")
+                    time.sleep(1.0)
+                    return
+
                 console_print_safe(f"[WARN] Telegram edit failed: {payload}")
                 return
+
             except Exception as exc:
                 with self._lock:
                     self._dirty = True
@@ -932,12 +971,15 @@ Any normal text message is sent to Codex as the next prompt.
 # Utility helpers used by main()
 # -----------------------------------------------------------------------------
 def build_topic_name(label: str, time_format: str) -> str:
-    """Return a human-readable topic name like `Codex Bridge | 03-18 14:30`."""
     try:
         timestamp = dt.datetime.now().strftime(time_format)
     except Exception:
         timestamp = dt.datetime.now().strftime("%m-%d %H:%M")
-    return f"{label} | {timestamp}"
+
+    raw = f"{label} | {timestamp}".strip(" |")
+    if len(raw) > 128:
+        raw = raw[:128].rstrip()
+    return raw
 
 
 def skip_pending_updates(tg: TelegramClient) -> int:
@@ -962,7 +1004,30 @@ def skip_pending_updates(tg: TelegramClient) -> int:
         console_print_safe(f"[INFO] Skipped {skipped} pending update(s) at startup.")
     return offset
 
+def acquire_instance_lock(path: str) -> int:
+    """Create a simple lock file so only one bridge instance uses the workdir."""
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+    except FileExistsError:
+        raise RuntimeError(f"Bridge appears to be already running: {path}")
 
+    os.write(fd, str(os.getpid()).encode("ascii"))
+    return fd
+
+
+def release_instance_lock(fd: int | None, path: str | None) -> None:
+    """Release the bridge lock file if it was acquired."""
+    if fd is None or path is None:
+        return
+
+    try:
+        os.close(fd)
+    finally:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        
 def run_discovery_mode(tg: TelegramClient, bot_username: str) -> int:
     """Print incoming Telegram metadata so users can fill `.env` safely.
 
@@ -985,8 +1050,9 @@ def run_discovery_mode(tg: TelegramClient, bot_username: str) -> int:
     while True:
         try:
             updates = tg.get_updates(offset=offset, timeout_s=30)
+            poll_failures = 0
         except KeyboardInterrupt:
-            print("\n[INFO] Discovery mode stopped.")
+            console_print_safe("[INFO] Discovery mode stopped.")
             return 0
         except Exception as exc:
             poll_failures += 1
@@ -1070,7 +1136,6 @@ def main() -> int:
 
     env_values = load_env_file(args.tg_env)
     for key, value in env_values.items():
-        # Respect existing environment variables so CI / shell overrides still win.
         os.environ.setdefault(key, value)
 
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -1090,327 +1155,369 @@ def main() -> int:
         return 2
 
     tg = TelegramClient(token)
-    try:
-        me = tg.get_me()
-    except Exception as exc:
-        print(f"Failed to reach Telegram Bot API: {exc}", file=sys.stderr)
-        return 2
-
-    bot_username = str(me.get("username", "") or "")
-    console_print_safe(f"[INFO] Bot username: @{bot_username}" if bot_username else "[INFO] Bot username: (none)")
-    
-    if args.tg_discover_ids:
-        return run_discovery_mode(tg, bot_username)
-
-    if not allowed_user_raw or not chat_id_raw:
-        print(
-            "Missing TELEGRAM_ALLOWED_USER_ID or TELEGRAM_CHAT_ID in .env / environment",
-            file=sys.stderr,
-        )
-        return 2
+    outbox: TelegramOutbox | None = None
+    lock_fd: int | None = None
+    lock_path: str | None = None
 
     try:
-        allowed_user_id = int(allowed_user_raw)
-        telegram_chat_id = int(chat_id_raw)
-    except ValueError:
-        print("TELEGRAM_ALLOWED_USER_ID and TELEGRAM_CHAT_ID must be integers", file=sys.stderr)
-        return 2
-
-    workdir = os.path.abspath(args.tg_workdir)
-    if not os.path.isdir(workdir):
-        print(f"Workdir does not exist or is not a directory: {workdir}", file=sys.stderr)
-        return 2
-
-    codex_bin = args.tg_codex_bin
-    if os.path.sep not in codex_bin and shutil.which(codex_bin) is None and shutil.which(f"{codex_bin}.cmd") is None:
-        print(f"[ERR] Cannot find Codex executable in PATH: {codex_bin}", file=sys.stderr)
-        return 2
-
-    use_topic = not args.tg_no_topic
-    if args.tg_use_topic:
-        if args.tg_no_topic:
-            console_print_safe("[WARN] --tg-no-topic overrides --tg-use-topic; using the main chat.")
-            use_topic = False
-        else:
-            console_print_safe("[INFO] --tg-use-topic is already the default behavior.")
-
-    telegram_thread_id: int | None = None
-    configured_thread_raw = os.environ.get("TELEGRAM_THREAD_ID", "").strip()
-
-    if use_topic and configured_thread_raw:
         try:
-            telegram_thread_id = int(configured_thread_raw)
-            console_print_safe(f"[INFO] Reusing configured Telegram thread_id={telegram_thread_id}")
-        except ValueError:
-            print("TELEGRAM_THREAD_ID must be an integer when set", file=sys.stderr)
-            return 2
-    elif use_topic:
-        env_label = os.environ.get("CODEX_TG_TOPIC_LABEL", "").strip()
-        cli_label = args.tg_topic_label.strip()
-        prefix_label = args.tg_topic_prefix.strip()
-        topic_label = env_label or cli_label or prefix_label or "Codex Telegram Bridge"
-
-        env_format = os.environ.get("CODEX_TG_TOPIC_TIME_FORMAT", "").strip()
-        cli_format = args.tg_topic_time_format.strip()
-        time_format = env_format or cli_format or "%m-%d %H:%M"
-
-        topic_name = build_topic_name(topic_label, time_format)
-        try:
-            topic = tg.create_forum_topic(telegram_chat_id, topic_name)
-            telegram_thread_id = int(topic["message_thread_id"])
-            console_print_safe(f"[INFO] Created Telegram topic: {topic_name} (thread_id={telegram_thread_id})")
+            me = tg.get_me()
         except Exception as exc:
-            console_print_safe("[WARN] createForumTopic failed. Falling back to the main chat. " + str(exc))
-            telegram_thread_id = None
-    else:
-        console_print_safe("[INFO] Using the main chat (no dedicated topic).")
+            print(f"Failed to reach Telegram Bot API: {exc}", file=sys.stderr)
+            return 2
 
-    send_interval_sec = _get_env_float("CODEX_TG_SEND_INTERVAL_SEC", 1.0, min_value=0.0)
-    tail_lines = _get_env_int("CODEX_TG_TAIL_LINES", 60, min_value=10)
-    tail_edit_sec = _get_env_float("CODEX_TG_TAIL_EDIT_SEC", 0.8, min_value=0.1)
+        bot_username = str(me.get("username", "") or "")
+        console_print_safe(
+            f"[INFO] Bot username: @{bot_username}" if bot_username else "[INFO] Bot username: (none)"
+        )
 
-    outbox = TelegramOutbox(tg, telegram_chat_id, telegram_thread_id, min_interval_sec=send_interval_sec)
-    workdir_display = workdir if workdir.endswith(("/", "\\")) else workdir + os.path.sep
-    outbox.send(
-        "Bridge is ready.\n"
-        f"Workdir: {workdir_display}\n"
-        f"Topic mode: {'on' if telegram_thread_id is not None else 'off'}\n"
-        "Send /help in Telegram for available commands."
-    )
+        if args.tg_discover_ids:
+            return run_discovery_mode(tg, bot_username)
 
-    runner = CodexRunner(
-        codex_bin=codex_bin,
-        workdir=workdir,
-        passthrough_args=passthrough,
-        debug_json_console=args.tg_debug_json,
-    )
-
-    offset = 0
-    if not args.tg_replay_pending_updates:
-        offset = skip_pending_updates(tg)
-
-    session_id: str | None = None
-
-    log_lock = threading.Lock()
-    last_log_lines: list[str] = []
-    running_tail: LiveTail | None = None
-    turn_guard = threading.Lock()
-
-    def append_log(line: str) -> None:
-        nonlocal last_log_lines, running_tail
-        safe_line = redact_secrets(line)
-
-        with log_lock:
-            last_log_lines.append(safe_line)
-            if len(last_log_lines) > MAX_STORED_LOG_LINES:
-                last_log_lines = last_log_lines[-4000:]
-
-        tail_ref = running_tail
-        if tail_ref is not None:
-            tail_ref.add_line(safe_line)
-
-    def run_in_thread(prompt: str) -> None:
-        nonlocal session_id, running_tail, last_log_lines
-
-        tail: LiveTail | None = None
+        if not allowed_user_raw or not chat_id_raw:
+            print(
+                "Missing TELEGRAM_ALLOWED_USER_ID or TELEGRAM_CHAT_ID in .env / environment",
+                file=sys.stderr,
+            )
+            return 2
 
         try:
-            with log_lock:
-                last_log_lines = []
+            allowed_user_id = int(allowed_user_raw)
+            telegram_chat_id = int(chat_id_raw)
+        except ValueError:
+            print("TELEGRAM_ALLOWED_USER_ID and TELEGRAM_CHAT_ID must be integers", file=sys.stderr)
+            return 2
 
-            tail = LiveTail(
-                tg,
-                telegram_chat_id,
-                telegram_thread_id,
-                max_lines=tail_lines,
-                edit_interval_sec=tail_edit_sec,
-            )
+        workdir = os.path.abspath(args.tg_workdir)
+        if not os.path.isdir(workdir):
+            print(f"Workdir does not exist or is not a directory: {workdir}", file=sys.stderr)
+            return 2
+
+        codex_bin = args.tg_codex_bin
+        if (
+            os.path.sep not in codex_bin
+            and shutil.which(codex_bin) is None
+            and shutil.which(f"{codex_bin}.cmd") is None
+        ):
+            print(f"[ERR] Cannot find Codex executable in PATH: {codex_bin}", file=sys.stderr)
+            return 2
+
+        lock_path = os.path.join(workdir, ".codex_tg_bridge.lock")
+        try:
+            lock_fd = acquire_instance_lock(lock_path)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
+        use_topic = not args.tg_no_topic
+        if args.tg_use_topic:
+            if args.tg_no_topic:
+                console_print_safe("[WARN] --tg-no-topic overrides --tg-use-topic; using the main chat.")
+                use_topic = False
+            else:
+                console_print_safe("[INFO] --tg-use-topic is already the default behavior.")
+
+        telegram_thread_id: int | None = None
+        configured_thread_raw = os.environ.get("TELEGRAM_THREAD_ID", "").strip()
+
+        if use_topic and configured_thread_raw:
+            try:
+                telegram_thread_id = int(configured_thread_raw)
+                console_print_safe(f"[INFO] Reusing configured Telegram thread_id={telegram_thread_id}")
+            except ValueError:
+                print("TELEGRAM_THREAD_ID must be an integer when set", file=sys.stderr)
+                return 2
+        elif use_topic:
+            env_label = os.environ.get("CODEX_TG_TOPIC_LABEL", "").strip()
+            cli_label = args.tg_topic_label.strip()
+            prefix_label = args.tg_topic_prefix.strip()
+            topic_label = env_label or cli_label or prefix_label or "Codex Telegram Bridge"
+
+            env_format = os.environ.get("CODEX_TG_TOPIC_TIME_FORMAT", "").strip()
+            cli_format = args.tg_topic_time_format.strip()
+            time_format = env_format or cli_format or "%m-%d %H:%M"
+
+            topic_name = build_topic_name(topic_label, time_format)
+            try:
+                topic = tg.create_forum_topic(telegram_chat_id, topic_name)
+                telegram_thread_id = int(topic["message_thread_id"])
+                console_print_safe(f"[INFO] Created Telegram topic: {topic_name} (thread_id={telegram_thread_id})")
+            except Exception as exc:
+                console_print_safe("[WARN] createForumTopic failed. Falling back to the main chat. " + str(exc))
+                telegram_thread_id = None
+        else:
+            console_print_safe("[INFO] Using the main chat (no dedicated topic).")
+
+        send_interval_sec = _get_env_float("CODEX_TG_SEND_INTERVAL_SEC", 1.0, min_value=0.0)
+        tail_lines = _get_env_int("CODEX_TG_TAIL_LINES", 60, min_value=10)
+        tail_edit_sec = _get_env_float("CODEX_TG_TAIL_EDIT_SEC", 0.8, min_value=0.1)
+
+        outbox = TelegramOutbox(tg, telegram_chat_id, telegram_thread_id, min_interval_sec=send_interval_sec)
+        workdir_display = workdir if workdir.endswith(("/", "\\")) else workdir + os.path.sep
+        outbox.send(
+            "Bridge is ready.\n"
+            f"Workdir: {workdir_display}\n"
+            f"Topic mode: {'on' if telegram_thread_id is not None else 'off'}\n"
+            "Send /help in Telegram for available commands."
+        )
+
+        runner = CodexRunner(
+            codex_bin=codex_bin,
+            workdir=workdir,
+            passthrough_args=passthrough,
+            debug_json_console=args.tg_debug_json,
+        )
+
+        offset = 0
+        if not args.tg_replay_pending_updates:
+            offset = skip_pending_updates(tg)
+
+        session_id: str | None = None
+
+        log_lock = threading.Lock()
+        last_log_lines: list[str] = []
+        running_tail: LiveTail | None = None
+        turn_guard = threading.Lock()
+
+        def append_log(line: str) -> None:
+            nonlocal last_log_lines, running_tail
+            safe_line = redact_secrets(line)
+
+            with log_lock:
+                last_log_lines.append(safe_line)
+                if len(last_log_lines) > MAX_STORED_LOG_LINES:
+                    last_log_lines = last_log_lines[-4000:]
+
+            tail_ref = running_tail
+            if tail_ref is not None:
+                tail_ref.add_line(safe_line)
+
+        def run_in_thread(prompt: str) -> None:
+            nonlocal session_id, running_tail, last_log_lines
+
+            tail: LiveTail | None = None
 
             try:
-                tail.start()
-                running_tail = tail
-            except Exception as exc:
-                console_print_safe(f"[WARN] live tail start failed: {exc}")
-                outbox.send(redact_secrets(f"Live tail disabled for this run: {exc}"))
-                tail = None
-                running_tail = None
+                with log_lock:
+                    last_log_lines = []
 
-            start_time = time.time()
+                tail = LiveTail(
+                    tg,
+                    telegram_chat_id,
+                    telegram_thread_id,
+                    max_lines=tail_lines,
+                    edit_interval_sec=tail_edit_sec,
+                )
 
-            def log(message: str) -> None:
-                elapsed = time.time() - start_time
-                line = f"[{elapsed:6.1f}s] {message}"
-                console_print_safe(redact_secrets(line))
-                append_log(line)
-
-            def on_session(new_sid: str) -> None:
-                if tail is not None:
-                    tail.set_session(new_sid)
-
-            def on_status(status: str) -> None:
-                if tail is not None:
-                    tail.set_status(status)
-
-            log(f"YOU: {prompt}")
-
-            new_sid, final_message, _stats, error = runner.run_turn(
-                prompt,
-                session_id=session_id,
-                on_session=on_session,
-                on_status=on_status,
-                on_log=log,
-            )
-
-            if new_sid:
-                session_id = new_sid
-
-            if error:
-                if tail is not None:
-                    tail.stop("failed")
-                outbox.send(redact_secrets(error.strip()))
-                return
-
-            if tail is not None:
-                tail.stop("done")
-
-            if final_message:
-                outbox.send(redact_secrets(final_message))
-            else:
-                outbox.send("No final assistant message was captured from the Codex JSON events.")
-
-        except Exception as exc:
-            console_print_safe(f"[WARN] bridge worker crashed: {exc}")
-            outbox.send(redact_secrets(f"Bridge worker crashed: {exc}"))
-            if tail is not None:
                 try:
-                    tail.stop("failed")
+                    tail.start()
+                    running_tail = tail
+                except Exception as exc:
+                    console_print_safe(f"[WARN] live tail start failed: {exc}")
+                    outbox.send(redact_secrets(f"Live tail disabled for this run: {exc}"))
+                    tail = None
+                    running_tail = None
+
+                start_time = time.time()
+
+                def log(message: str) -> None:
+                    elapsed = time.time() - start_time
+                    line = f"[{elapsed:6.1f}s] {message}"
+                    console_print_safe(redact_secrets(line))
+                    append_log(line)
+
+                def on_session(new_sid: str) -> None:
+                    if tail is not None:
+                        tail.set_session(new_sid)
+
+                def on_status(status: str) -> None:
+                    if tail is not None:
+                        tail.set_status(status)
+
+                log(f"YOU: {prompt}")
+
+                new_sid, final_message, _stats, error = runner.run_turn(
+                    prompt,
+                    session_id=session_id,
+                    on_session=on_session,
+                    on_status=on_status,
+                    on_log=log,
+                )
+
+                if new_sid:
+                    session_id = new_sid
+
+                if error:
+                    if tail is not None:
+                        tail.stop("failed")
+                    outbox.send(redact_secrets(error.strip()))
+                    return
+
+                if tail is not None:
+                    tail.stop("done")
+
+                if final_message:
+                    outbox.send(redact_secrets(final_message))
+                else:
+                    outbox.send("No final assistant message was captured from the Codex JSON events.")
+
+            except Exception as exc:
+                console_print_safe(f"[WARN] bridge worker crashed: {exc}")
+                outbox.send(redact_secrets(f"Bridge worker crashed: {exc}"))
+                if tail is not None:
+                    try:
+                        tail.stop("failed")
+                    except Exception:
+                        pass
+            finally:
+                running_tail = None
+                try:
+                    turn_guard.release()
+                except RuntimeError:
+                    pass
+
+        console_print_safe("[INFO] Listening via getUpdates... (Ctrl+C to stop)")
+        console_print_safe(f"[INFO] workdir = {workdir}")
+        console_print_safe(f"[INFO] Passthrough Codex args: {passthrough}")
+        console_print_safe(
+            f"[INFO] Outbox pacing: {send_interval_sec}s | "
+            f"LiveTail: lines={tail_lines}, edit={tail_edit_sec}s"
+        )
+
+        poll_failures = 0
+
+        try:
+            while True:
+                try:
+                    updates = tg.get_updates(offset=offset, timeout_s=30)
+                    poll_failures = 0
+                except KeyboardInterrupt:
+                    console_print_safe("[INFO] Stopped.")
+                    return 0
+                except TelegramAPIError as exc:
+                    payload = exc.payload
+                    code = payload.get("error_code")
+                    desc = str(payload.get("description", ""))
+                    console_print_safe(f"[ERR] getUpdates TelegramAPIError {code}: {desc or payload}")
+
+                    if code in {401, 403, 409}:
+                        return 2
+
+                    poll_failures += 1
+                    sleep_s = min(15.0, 0.5 * (2 ** min(poll_failures - 1, 5)))
+                    time.sleep(sleep_s)
+                    continue
+                except Exception as exc:
+                    poll_failures += 1
+                    sleep_s = min(15.0, 0.5 * (2 ** min(poll_failures - 1, 5)))
+                    console_print_safe(
+                        f"[WARN] getUpdates failed #{poll_failures}: "
+                        f"{type(exc).__name__}: {exc}. retry in {sleep_s:.1f}s"
+                    )
+                    time.sleep(sleep_s)
+                    continue
+
+                for update in updates:
+                    offset = max(offset, int(update.get("update_id", 0)) + 1)
+                    message = update.get("message")
+                    if not message:
+                        continue
+
+                    from_user = message.get("from") or {}
+                    if from_user.get("id") != allowed_user_id:
+                        continue
+
+                    chat = message.get("chat") or {}
+                    if chat.get("id") != telegram_chat_id:
+                        continue
+
+                    if telegram_thread_id is not None and message.get("message_thread_id") != telegram_thread_id:
+                        continue
+
+                    text = (message.get("text") or "").strip()
+                    if not text:
+                        continue
+
+                    if text in {"/help", f"/help@{bot_username}"}:
+                        outbox.send(HELP_TEXT)
+                        continue
+
+                    if text in {"/status", f"/status@{bot_username}"}:
+                        busy = turn_guard.locked() or runner.is_running()
+                        outbox.send(
+                            "Status\n"
+                            f"- Running: {busy}\n"
+                            f"- Session reuse: {'active' if session_id else '(not started yet)'}\n"
+                            f"- Workdir: {workdir}\n"
+                            f"- Topic mode: {'on' if telegram_thread_id is not None else 'off'}"
+                        )
+                        continue
+
+                    if text in {"/new", f"/new@{bot_username}"}:
+                        if turn_guard.locked() or runner.is_running():
+                            outbox.send("Codex is currently running. Use /cancel first, then try again.")
+                            continue
+                        session_id = None
+                        outbox.send("Session reset. The next prompt will start a fresh `codex exec` session.")
+                        continue
+
+                    if text in {"/cancel", f"/cancel@{bot_username}"}:
+                        cancelled = runner.cancel()
+                        outbox.send("Cancel request sent." if cancelled else "There is no active Codex run to cancel.")
+                        continue
+
+                    if text.startswith("/log"):
+                        parts = text.split()
+                        count = 120
+                        if len(parts) >= 2:
+                            try:
+                                count = int(parts[1])
+                            except Exception:
+                                count = 120
+
+                        with log_lock:
+                            lines = last_log_lines[-max(10, min(count, 800)) :]
+                        outbox.send("\n".join(lines) if lines else "(No stored log lines yet.)")
+                        continue
+
+                    if turn_guard.locked() or runner.is_running():
+                        outbox.send("Codex is already running. Wait for it to finish or use /cancel.")
+                        continue
+
+                    if not turn_guard.acquire(blocking=False):
+                        outbox.send("Codex is already starting or running. Wait for it to finish or use /cancel.")
+                        continue
+
+                    worker = threading.Thread(target=run_in_thread, args=(text,), name="codex-turn", daemon=True)
+                    try:
+                        worker.start()
+                    except Exception:
+                        turn_guard.release()
+                        raise
+        finally:
+            if runner.is_running():
+                console_print_safe("[INFO] Shutting down active Codex process...")
+                runner.cancel()
+                time.sleep(0.5)
+
+            tail_ref = running_tail
+            if tail_ref is not None:
+                try:
+                    tail_ref.stop("failed")
                 except Exception:
                     pass
-        finally:
-            running_tail = None
+
+    finally:
+        if outbox is not None:
             try:
-                turn_guard.release()
-            except RuntimeError:
+                outbox.close(drain_timeout=5.0)
+            except Exception:
                 pass
 
-    console_print_safe("[INFO] Listening via getUpdates... (Ctrl+C to stop)")
-    console_print_safe(f"[INFO] workdir = {workdir}")
-    console_print_safe(f"[INFO] Passthrough Codex args: {passthrough}")
-    console_print_safe(
-        f"[INFO] Outbox pacing: {send_interval_sec}s | "
-        f"LiveTail: lines={tail_lines}, edit={tail_edit_sec}s"
-    )
-
-    poll_failures = 0
-    
-    while True:
         try:
-            updates = tg.get_updates(offset=offset, timeout_s=30)
-            poll_failures = 0
-        except KeyboardInterrupt:
-            print("\n[INFO] Stopped.")
-            return 0
-        except TelegramAPIError as exc:
-            payload = exc.payload
-            code = payload.get("error_code")
-            desc = str(payload.get("description", ""))
-            console_print_safe(f"[ERR] getUpdates TelegramAPIError {code}: {desc or payload}")
-
-            if code in {401, 403, 409}:
-                return 2
-
-            poll_failures += 1
-            sleep_s = min(15.0, 0.5 * (2 ** min(poll_failures - 1, 5)))
-            time.sleep(sleep_s)
-            continue
-        except Exception as exc:
-            poll_failures += 1
-            sleep_s = min(15.0, 0.5 * (2 ** min(poll_failures - 1, 5)))
-            console_print_safe(
-                f"[WARN] getUpdates failed #{poll_failures}: "
-                f"{type(exc).__name__}: {exc}. retry in {sleep_s:.1f}s"
-            )
-            time.sleep(sleep_s)
-            continue
-
-        for update in updates:
-            offset = max(offset, int(update.get("update_id", 0)) + 1)
-            message = update.get("message")
-            if not message:
-                continue
-
-            from_user = message.get("from") or {}
-            if from_user.get("id") != allowed_user_id:
-                continue
-
-            chat = message.get("chat") or {}
-            if chat.get("id") != telegram_chat_id:
-                continue
-
-            if telegram_thread_id is not None and message.get("message_thread_id") != telegram_thread_id:
-                continue
-
-            text = (message.get("text") or "").strip()
-            if not text:
-                continue
-
-            if text in {"/help", f"/help@{bot_username}"}:
-                outbox.send(HELP_TEXT)
-                continue
-
-            if text in {"/status", f"/status@{bot_username}"}:
-                busy = turn_guard.locked() or runner.is_running()
-                outbox.send(
-                    "Status\n"
-                    f"- Running: {busy}\n"
-                    f"- Session reuse: {'active' if session_id else '(not started yet)'}\n"
-                    f"- Workdir: {workdir}\n"
-                    f"- Topic mode: {'on' if telegram_thread_id is not None else 'off'}"
-                )
-                continue
-
-            if text in {"/new", f"/new@{bot_username}"}:
-                if turn_guard.locked() or runner.is_running():
-                    outbox.send("Codex is currently running. Use /cancel first, then try again.")
-                    continue
-                session_id = None
-                outbox.send("Session reset. The next prompt will start a fresh `codex exec` session.")
-                continue
-
-            if text in {"/cancel", f"/cancel@{bot_username}"}:
-                cancelled = runner.cancel()
-                outbox.send("Cancel request sent." if cancelled else "There is no active Codex run to cancel.")
-                continue
-
-            if text.startswith("/log"):
-                parts = text.split()
-                count = 120
-                if len(parts) >= 2:
-                    try:
-                        count = int(parts[1])
-                    except Exception:
-                        count = 120
-
-                with log_lock:
-                    lines = last_log_lines[-max(10, min(count, 800)) :]
-                outbox.send("\n".join(lines) if lines else "(No stored log lines yet.)")
-                continue
-
-            if turn_guard.locked() or runner.is_running():
-                outbox.send("Codex is already running. Wait for it to finish or use /cancel.")
-                continue
-
-            if not turn_guard.acquire(blocking=False):
-                outbox.send("Codex is already starting or running. Wait for it to finish or use /cancel.")
-                continue
-
-            worker = threading.Thread(target=run_in_thread, args=(text,), name="codex-turn", daemon=True)
-            try:
-                worker.start()
-            except Exception:
-                turn_guard.release()
-                raise
-
+            tg.close()
+        finally:
+            release_instance_lock(lock_fd, lock_path)
 
 if __name__ == "__main__":
     raise SystemExit(main())
