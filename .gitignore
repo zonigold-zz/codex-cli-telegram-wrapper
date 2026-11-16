@@ -1,3 +1,22 @@
+# Local credentials and deployment settings
 .env
+.env.*
+!.env.example
+.codex_tg_deployment.json
+.codex/
+.agents/
+# Runtime state, logs and Python caches
 __pycache__/
-*.pyc
+*.py[cod]
+.venv/
+venv/
+*.sqlite3*
+*.db*
+*.log
+*.lock
+control.stop
+state/
+# Private project material never belongs in this bridge repository
+data/
+raw/
+outputs/
