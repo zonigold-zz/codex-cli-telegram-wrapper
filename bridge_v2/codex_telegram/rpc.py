@@ -11,7 +11,9 @@ from .config import codex_executable
 
 
 class RPCError(RuntimeError):
-    pass
+    def __init__(self, message, *, code=None):
+        super().__init__(message)
+        self.code = code
 
 
 class AppServer:
@@ -108,7 +110,8 @@ class AppServer:
             except queue.Empty:
                 raise RPCError(f"Codex response timeout: {method}") from None
             if "error" in response:
-                raise RPCError(self.redact(response["error"]))
+                error = response["error"]
+                raise RPCError(self.redact(error.get("message") or error), code=error.get("code"))
             return response.get("result", {})
         finally:
             with self.pending_lock:

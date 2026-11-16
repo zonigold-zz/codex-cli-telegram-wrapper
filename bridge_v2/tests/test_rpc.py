@@ -18,6 +18,10 @@ for line in sys.stdin:
     if method == 'initialized': continue
     if method == 'test/timeout': continue
     if method == 'test/exit': break
+    if method == 'test/error':
+        print(json.dumps({'id':message['id'],'error':{'code':-32600,
+                          'message':'synthetic-token already has an active writer'}}), flush=True)
+        continue
     if method == 'test/approval':
         print(json.dumps({'id': 9000, 'method': 'item/commandExecution/requestApproval',
                           'params': {'threadId': 'thread-1', 'turnId': 'turn-1'}}), flush=True)
@@ -63,6 +67,14 @@ class RPCTests(unittest.TestCase):
     def test_response_timeout_is_bounded(self):
         with self.assertRaises(RPCError):
             self.rpc.request('test/timeout', {}, timeout=.05)
+        self.assertEqual(self.rpc.pending, {})
+
+    def test_structured_error_code_survives_with_secret_redaction(self):
+        with self.assertRaises(RPCError) as caught:
+            self.rpc.request('test/error', {})
+        self.assertEqual(caught.exception.code, -32600)
+        self.assertIn('already has an active writer', str(caught.exception))
+        self.assertNotIn('synthetic-token', str(caught.exception))
         self.assertEqual(self.rpc.pending, {})
 
     def test_disconnect_fails_pending_request(self):

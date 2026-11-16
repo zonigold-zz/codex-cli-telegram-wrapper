@@ -16,7 +16,9 @@ STEP_SCHEMA = object_schema({
     "title": STR, "instructions": STR,
     "checks": {"type": "array", "items": {"type": "array", "items": STR, "minItems": 1}, "minItems": 1},
 })
-PLAN_SCHEMA = object_schema({"goal": STR, "scope": STR,
+PLAN_SCHEMA = object_schema({"goal": STR, "scope": {
+    **STR, "description": "Implementation scope to authorize later with /auto on: paths, actions, and exclusions. "
+    "Do not copy the draft-only/read-only planning phase into this execution scope."},
                              "steps": {"type": "array", "items": STEP_SCHEMA, "minItems": 1, "maxItems": 12}})
 RESULT_SCHEMA = object_schema({
     "status": {"type": "string", "enum": ["step_done", "continue", "retry", "needs_input", "needs_approval", "blocked"]},
@@ -83,6 +85,9 @@ def step_prompt(plan, index):
     return (f"승인된 계획의 {index + 1}/{len(plan['steps'])}단계를 수행하세요.\n"
             f"목표: {plan['goal']}\n허용 범위: {plan['scope']}\n"
             f"현재 단계: {step['title']}\n지시: {step['instructions']}\n"
+            "사용자가 계획을 검토하고 /auto on으로 이 실행 단계를 요청했습니다. "
+            "계획 초안 작성 당시의 미실행·읽기 전용 조건은 기획 단계에만 해당합니다. "
+            "실제 실행은 위 허용 범위와 현재 도구의 권한 안에서만 수행하세요. "
             "이미 승인된 현재 단계의 일상적인 구현·검증·다음 작업을 다시 물을 필요는 없습니다. "
             "기존 AGENTS.md, 원본 보호, 실제 권한 및 사용자 중단을 따르세요. "
             "새 권한이나 계획 밖 결정을 임의로 승인하지 마세요. "

@@ -138,14 +138,17 @@ class Engine:
             result["config"] = {"model_reasoning_effort": effort}
         if temporary or self.config.read_only:
             config = self.project_config()
-            parent = config.get("default_permissions") or {
-                "read-only": ":read-only", "danger-full-access": ":danger-full-access"
-            }.get(config.get("sandbox_mode"), ":workspace")
-            # Inherit denies and project-specific restrictions; only reduce writes/network.
-            result.setdefault("config", {})["permissions"] = {"bridge_planning_readonly": {
-                "extends": parent, "filesystem": {":workspace_roots": {".": "read"}},
-                "network": {"enabled": False}}}
-            result["permissions"] = "bridge_planning_readonly"
+            parent = config.get("default_permissions")
+            if parent and not parent.startswith(":"):
+                # Retain custom denies (for example .env/raw protections).
+                result.setdefault("config", {})["permissions"] = {"bridge_planning_readonly": {
+                    "extends": parent, "filesystem": {":workspace_roots": {".": "read"}},
+                    "network": {"enabled": False}}}
+                result["permissions"] = "bridge_planning_readonly"
+            else:
+                # Deriving a named profile from implicit :workspace can fail workspace
+                # requirements hydration in Codex 0.166. Use its native read-only profile.
+                result["permissions"] = ":read-only"
             if temporary:
                 result["ephemeral"] = True
         return result
@@ -153,12 +156,25 @@ class Engine:
     def thread(self, temporary=False):
         self.rpc.start()
         options = self._thread_options(temporary=temporary)
-        saved = None if temporary else self.store.get("codex_thread")
+        saved = self.store.get("codex_thread")
+        if temporary:
+            if saved:
+                self.check_thread_scope(saved)
+                result = self.rpc.request("thread/fork", {"threadId": saved, "excludeTurns": True, **options})
+            else:
+                result = self.rpc.request("thread/start", {**options, "developerInstructions": BRIDGE_INSTRUCTIONS})
+            self.active_permission_profile = (result.get("activePermissionProfile") or {}).get("id")
+            return result["thread"]["id"]
         if saved and self.loaded_thread == saved and self.loaded_generation == self.rpc.generation:
             self.active_permission_profile = self.loaded_permission_profile
             return saved
         if saved:
-            result = self.rpc.request("thread/resume", {"threadId": saved, **options})
+            try:
+                result = self.rpc.request("thread/resume", {"threadId": saved, "excludeTurns": True, **options})
+            except RPCError as exc:
+                if exc.code != -32600 or "already has an active writer" not in str(exc):
+                    raise
+                result = self.recover_thread_writer(saved, options)
         else:
             result = self.rpc.request("thread/start", {**options, "developerInstructions": BRIDGE_INSTRUCTIONS})
         thread_id = result["thread"]["id"]
@@ -168,6 +184,60 @@ class Engine:
             self.loaded_thread, self.loaded_generation = thread_id, self.rpc.generation
             self.loaded_permission_profile = self.active_permission_profile
         return thread_id
+
+    def check_thread_scope(self, thread_id):
+        thread = self.rpc.request("thread/read", {"threadId": thread_id, "includeTurns": False})["thread"]
+        cwd = thread.get("cwd")
+        if not cwd or os.path.normcase(os.path.abspath(cwd)) != os.path.normcase(str(self.config.workdir)):
+            raise RPCError("다른 프로젝트의 대화를 이 브릿지에서 사용할 수 없습니다.")
+        return thread
+
+    def recover_thread_writer(self, thread_id, options):
+        thread = self.check_thread_scope(thread_id)
+        turns = self.rpc.request("thread/turns/list", {"threadId": thread_id, "limit": 1,
+                                                       "sortDirection": "desc"}).get("data", [])
+        latest = turns[0] if turns else None
+        if ((thread.get("status") or {}).get("type") == "active"
+                or (latest and latest.get("status") == "inProgress")):
+            raise RPCError("이 대화에서 다른 Codex 작업이 진행 중입니다. 중복 실행을 막기 위해 대기합니다. "
+                           "해당 작업 종료 후 요청을 다시 보내세요.")
+        params = {"threadId": thread_id, "excludeTurns": True, **options}
+        if latest:
+            params["lastTurnId"] = latest["id"]
+        result = self.rpc.request("thread/fork", params)
+        new_id = result["thread"]["id"]
+        if new_id == thread_id:
+            raise RPCError("대화 복구 응답이 원래 대화와 같습니다. 작업을 시작하지 않았습니다.")
+        self.store.audit("thread_writer_recovered", {"from": thread_id, "to": new_id})
+        self.say("기존 대화를 다른 Codex 연결이 점유하고 있어, 저장된 대화 이력을 복사한 새 대화로 이어갑니다. "
+                 "원래 대화 기록은 보존했습니다.", priority=0)
+        return result
+
+    def release_temporary_thread(self, thread_id):
+        if not thread_id or not self.rpc.alive:
+            return
+        try:
+            self.rpc.request("thread/unsubscribe", {"threadId": thread_id}, timeout=10)
+        except RPCError as exc:
+            self.log("제안·계획용 임시 대화 정리 대기: " + self.redact(exc))
+
+    def failure_reason(self, error, fallback="Codex가 상세 원인을 제공하지 않았습니다."):
+        if isinstance(error, dict):
+            message = error.get("message") or fallback
+            detail = error.get("additionalDetails")
+            if detail and detail not in message:
+                message += " · " + str(detail)
+        else:
+            message = str(error) if error else fallback
+        return self.redact(message)[:1600]
+
+    def record_failure(self, job, reason):
+        reason = self.failure_reason(reason)
+        self.store.set("last_failure", {"job": job["id"], "reason": reason, "time": time.time()})
+        self.store.audit("job_failed", {"job": job["id"], "reason": reason})
+        self.say(f"작업 {job['id']} 실패\n원인: {reason}\n"
+                 "작업은 자동 재실행하지 않았습니다. /status · /log로 확인하세요.", priority=0,
+                 dedupe=f"failure:{job['id']}")
 
     def enqueue(self, text, source, kind="chat"):
         job_id = self.store.enqueue_job(json.dumps({"kind": kind, "text": text}, ensure_ascii=False), source)
@@ -479,6 +549,8 @@ class Engine:
         progress = f"{self.store.get('plan_index', 0) + 1}/{len(plan['steps'])}" if plan else "없음"
         with self.store.lock:
             reviews = [r[0] for r in self.store.db.execute("SELECT id FROM jobs WHERE status='review_required' ORDER BY created DESC LIMIT 5")]
+        failure = self.store.get("last_failure")
+        failure_text = (f"\n최근 실패: {failure['job']} · {failure['reason'][:700]}" if failure else "")
         self.say(f"Codex Bridge v2\n프로젝트: {self.config.workdir}\n"
                  f"현재 작업: {self.active_job or '대기'}\n현재 모델: {self.active_model or '대기'}\n"
                  f"다음 모델: {self.selected_model() or '기본값'}\n"
@@ -486,7 +558,7 @@ class Engine:
                  f"자동 진행: {self.store.get('auto_mode', 'paused')} · 단계 {progress}\n"
                  f"대화: {self.store.get('codex_thread') or '시작 전'}\n"
                  f"질문/승인 대기: {len(self.pending_requests)}\n"
-                 f"재시작 후 확인 대기 작업: {', '.join(reviews) or '없음'}", priority=0)
+                 f"재시작 후 확인 대기 작업: {', '.join(reviews) or '없음'}" + failure_text, priority=0)
 
     def show_plan(self):
         plan = self.store.get("plan")
@@ -768,9 +840,11 @@ class Engine:
             except Exception as exc:
                 self.store.update_job(job["id"], status="failed", error=self.redact(exc), finished=time.time())
                 self.store.set("auto_mode", "paused")
-                self.say(f"작업 {job['id']} 실패: {self.redact(exc)}\n자동 재실행하지 않았습니다. /status로 확인하세요.", priority=0)
+                self.record_failure(job, exc)
                 logging.error("Job failed: %s", self.redact(exc))
             finally:
+                if json.loads(job["prompt"]).get("kind") in ("suggest", "plan_draft"):
+                    self.release_temporary_thread(self.active_thread)
                 if self.live_id:
                     record = self.store.job(job["id"])
                     self.sender.edit(self.live_id, f"작업 {job['id']} · {record['status']}", f"live:{job['id']}")
@@ -793,8 +867,17 @@ class Engine:
         self.active_model = self.selected_model() or "계정 기본값"
         schema = PLAN_SCHEMA if kind == "plan_draft" else SUGGEST_SCHEMA if kind == "suggest" else RESULT_SCHEMA if kind == "plan_step" else None
         if kind == "plan_draft":
+            execution_profile = self.project_config().get("default_permissions") or {
+                "read-only": ":read-only", "danger-full-access": ":danger-full-access"
+            }.get(self.project_config().get("sandbox_mode"), ":workspace")
+            if self.config.read_only:
+                execution_profile = "read-only (project restrictions retained)"
             prompt = ("기획만 수행하세요. 구현·수정·네트워크 접근을 실행하지 마세요. "
                       "사용자의 목표에 대해 명시적인 허용 범위와 1–12단계를 작성하세요. "
+                      "scope에는 사용자가 /auto on으로 승인할 구현 단계의 경로·행동·제외 사항을 작성하세요. "
+                      "현재 초안 작성용 읽기 전용 권한이나 '아직 실행하지 마세요'를 구현 scope의 금지 조건으로 복사하지 마세요. "
+                      "구현 단계는 프로젝트의 기존 실행 권한으로 돌아가며 그 밖의 권한을 새로 부여하지 않습니다. "
+                      f"구현 단계의 기존 권한 프로필: {execution_profile}. "
                       "각 단계에는 완료 여부를 확인할 실제 검증 명령(argv 배열)이 있어야 합니다. "
                       "명령은 프로젝트 경로와 기존 권한 안에서 실행 가능해야 합니다. "
                       "설치·외부 업로드·커밋·push는 사용자에게 이미 허용받은 경우만 계획에 포함하세요.\n목표:\n" + prompt)
@@ -834,10 +917,14 @@ class Engine:
         turn = self.wait_turn(turn_id, deadline)
         status = turn.get("status")
         if status != "completed":
+            reason = self.failure_reason(turn.get("error"), status or "unknown status")
             self.store.update_job(job["id"], status="cancelled" if status == "interrupted" else "failed",
-                                  error=self.redact(turn.get("error") or status), finished=time.time())
+                                  error=reason, finished=time.time())
             self.store.set("auto_mode", "paused")
-            self.say(f"작업 {job['id']} · {status}\n자동 진행은 정지했습니다.", priority=0)
+            if status == "interrupted":
+                self.say(f"작업 {job['id']} · 중단됨\n자동 진행은 정지했습니다.", priority=0)
+            else:
+                self.record_failure(job, reason)
             return
         texts = self.messages.pop(turn_id, [])
         # Some backends include final items on completion instead of emitting item/completed.

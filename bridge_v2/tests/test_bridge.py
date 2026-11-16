@@ -38,6 +38,8 @@ class FakeRPC:
                         (('low', 'medium', 'high', 'max', 'ultra') if name == 'model-a' else ('medium', 'high'))],
                     'defaultReasoningEffort': 'medium', 'isDefault': name == 'model-a'}
                     for name in ('model-a', 'model-b')]}
+        if method == 'thread/fork':
+            return {'thread': {'id': 'fork-1'}}
         if method in ('thread/start', 'thread/resume'):
             return {'thread': {'id': params.get('threadId', 'thread-1')}}
         if method == 'thread/read':
@@ -495,6 +497,194 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(options['permissions'], 'bridge_planning_readonly')
         self.assertEqual(options['config']['permissions']['bridge_planning_readonly']['extends'], 'protected-project')
         self.assertFalse(options['config']['permissions']['bridge_planning_readonly']['network']['enabled'])
+
+    def test_implicit_workspace_planning_uses_native_readonly(self):
+        self.engine.project_config = lambda: {}
+        options = self.engine._thread_options(temporary=True)
+        self.assertEqual(options['permissions'], ':read-only')
+        self.assertTrue(options['ephemeral'])
+        self.assertNotIn('permissions', options.get('config', {}))
+
+    def test_builtin_default_does_not_create_invalid_derived_profile(self):
+        for parent in (':workspace', ':read-only', ':danger-full-access'):
+            with self.subTest(parent=parent):
+                self.engine.project_config = lambda: {'default_permissions': parent}
+                options = self.engine._thread_options(temporary=True)
+                self.assertEqual(options['permissions'], ':read-only')
+                self.assertNotIn('permissions', options.get('config', {}))
+
+    def test_explicit_readonly_retains_custom_deny_parent(self):
+        self.config.read_only = True
+        self.engine.project_config = lambda: {'default_permissions': 'protected-project'}
+        options = self.engine._thread_options()
+        self.assertEqual(options['config']['permissions']['bridge_planning_readonly']['extends'], 'protected-project')
+        self.assertNotIn('ephemeral', options)
+
+    def test_suggestion_forks_history_without_changing_main_conversation(self):
+        self.store.set('codex_thread', 'original-thread')
+        self.engine.loaded_thread = 'original-thread'
+        self.engine.loaded_generation = 1
+        fork = self.engine.thread(temporary=True)
+        self.assertEqual(fork, 'fork-1')
+        params = next(params for method, params in self.rpc.calls if method == 'thread/fork')
+        self.assertEqual(params['threadId'], 'original-thread')
+        self.assertTrue(params['ephemeral'])
+        self.assertTrue(params['excludeTurns'])
+        self.assertEqual(params['permissions'], ':read-only')
+        self.assertEqual(self.store.get('codex_thread'), 'original-thread')
+        self.assertEqual(self.engine.loaded_thread, 'original-thread')
+
+    def test_temporary_thread_rejects_other_project_history(self):
+        self.store.set('codex_thread', 'wrong-project')
+        self.rpc.cwd = str(self.root.parent / 'other-project')
+        with self.assertRaisesRegex(RPCError, '다른 프로젝트'):
+            self.engine.thread(temporary=True)
+        self.assertNotIn('thread/fork', [method for method, _ in self.rpc.calls])
+
+    def test_temporary_thread_without_history_starts_readonly(self):
+        self.assertEqual(self.engine.thread(temporary=True), 'thread-1')
+        params = next(params for method, params in self.rpc.calls if method == 'thread/start')
+        self.assertEqual(params['permissions'], ':read-only')
+        self.assertTrue(params['ephemeral'])
+
+    def writer_conflict(self, active=False, foreign=False):
+        self.store.set('codex_thread', 'original-thread')
+        original = self.rpc.request
+        def request(method, params, timeout=45):
+            if method == 'thread/resume':
+                self.rpc.calls.append((method, params))
+                raise RPCError('thread original-thread already has an active writer', code=-32600)
+            if method == 'thread/read':
+                self.rpc.calls.append((method, params))
+                return {'thread': {'id': 'original-thread',
+                    'cwd': str(self.root.parent / 'foreign') if foreign else str(self.root),
+                    'status': {'type': 'idle'}}}
+            if method == 'thread/turns/list':
+                self.rpc.calls.append((method, params))
+                return {'data': [{'id': 'latest-turn', 'status': 'inProgress' if active else 'completed'}]}
+            return original(method, params, timeout)
+        self.rpc.request = request
+
+    def test_idle_writer_conflict_recovers_history_once(self):
+        self.writer_conflict()
+        self.assertEqual(self.engine.thread(), 'fork-1')
+        self.assertEqual(self.store.get('codex_thread'), 'fork-1')
+        fork = next(params for method, params in self.rpc.calls if method == 'thread/fork')
+        self.assertEqual(fork['lastTurnId'], 'latest-turn')
+        self.assertNotIn('ephemeral', fork)
+        self.assertIn('대화 이력', self.sender.sent[-1][0])
+        self.engine.thread()
+        self.assertEqual(sum(method == 'thread/fork' for method, _ in self.rpc.calls), 1)
+
+    def test_active_writer_is_not_forked_into_concurrent_execution(self):
+        self.writer_conflict(active=True)
+        with self.assertRaisesRegex(RPCError, '진행 중'):
+            self.engine.thread()
+        self.assertEqual(self.store.get('codex_thread'), 'original-thread')
+        self.assertNotIn('thread/fork', [method for method, _ in self.rpc.calls])
+
+    def test_foreign_writer_history_is_not_copied(self):
+        self.writer_conflict(foreign=True)
+        with self.assertRaisesRegex(RPCError, '다른 프로젝트'):
+            self.engine.thread()
+        self.assertNotIn('thread/fork', [method for method, _ in self.rpc.calls])
+
+    def test_non_writer_resume_error_does_not_fork_or_retry(self):
+        self.store.set('codex_thread', 'original-thread')
+        def request(method, params, timeout=45):
+            self.rpc.calls.append((method, params))
+            raise RPCError('permission denied', code=-32600)
+        self.rpc.request = request
+        with self.assertRaisesRegex(RPCError, 'permission denied'):
+            self.engine.thread()
+        self.assertEqual([method for method, _ in self.rpc.calls], ['thread/resume'])
+
+    def test_ambiguous_resume_timeout_does_not_start_another_conversation(self):
+        self.store.set('codex_thread', 'original-thread')
+        def request(method, params, timeout=45):
+            self.rpc.calls.append((method, params))
+            raise RPCError('Codex response timeout: thread/resume')
+        self.rpc.request = request
+        with self.assertRaises(RPCError):
+            self.engine.thread()
+        self.assertEqual(len(self.rpc.calls), 1)
+
+    def test_suggestion_button_and_slash_create_same_job_kind(self):
+        self.store.set('last_final', 'synthetic completed result')
+        self.engine.handle_update(self.update('/suggest'))
+        self.engine.handle_action({'type': 'suggest'}, 'button-2')
+        with self.store.lock:
+            jobs = [json.loads(row[0]) for row in self.store.db.execute('SELECT prompt FROM jobs')]
+        self.assertEqual([job['kind'] for job in jobs], ['suggest', 'suggest'])
+        self.assertTrue(all('synthetic completed result' in job['text'] for job in jobs))
+
+    def test_temporary_thread_cleanup_does_not_close_main_server(self):
+        self.store.set('codex_thread', 'original-thread')
+        self.engine.release_temporary_thread('temporary-1')
+        self.assertEqual(self.rpc.calls[-1], ('thread/unsubscribe', {'threadId': 'temporary-1'}))
+        self.assertTrue(self.rpc.alive)
+        self.assertEqual(self.store.get('codex_thread'), 'original-thread')
+
+    def test_cleanup_error_cannot_hide_generation_result(self):
+        def request(*args, **kwargs): raise RPCError('cleanup unavailable')
+        self.rpc.request = request
+        self.engine.release_temporary_thread('temporary-1')
+        self.assertIn('cleanup unavailable', self.engine.logs[-1])
+
+    def test_failed_turn_shows_real_cause_and_persists_diagnostic(self):
+        self.rpc.on_start = lambda: self.engine.completed.update({'turn-1': {'id': 'turn-1', 'status': 'failed',
+            'error': {'message': 'failed to load workspace requirements: invalid input parameter'}}})
+        job = self.store.enqueue_job(json.dumps({'kind': 'suggest', 'text': 'synthetic suggestion'}), 'failure-test')
+        self.engine.run_job(self.store.job(job))
+        self.assertEqual(self.store.job(job)['status'], 'failed')
+        self.assertIn('failed to load workspace requirements', self.sender.sent[-1][0])
+        self.assertEqual(self.store.get('last_failure')['job'], job)
+        self.engine.status()
+        self.assertIn('invalid input parameter', self.sender.sent[-1][0])
+
+    def test_failure_details_are_redacted_and_never_reexecuted(self):
+        self.engine.record_failure({'id': 'synthetic'}, {'message': 'request failed',
+                'additionalDetails': self.config.token + ' synthetic-key-12345'})
+        text = self.sender.sent[-1][0]
+        self.assertIn('request failed', text)
+        self.assertNotIn(self.config.token, text)
+        self.assertNotIn('synthetic-key-12345', text)
+        self.assertEqual(self.rpc.calls, [])
+        self.assertIsNone(self.store.next_job())
+
+    def test_failed_turn_does_not_emit_a_false_suggestion(self):
+        self.rpc.on_start = lambda: self.engine.completed.update({'turn-1': {'id': 'turn-1', 'status': 'failed',
+                        'error': {'message': 'upstream unavailable'}}})
+        job = self.store.enqueue_job(json.dumps({'kind': 'suggest', 'text': 'synthetic'}), 'no-suggestion')
+        self.engine.run_job(self.store.job(job))
+        self.assertFalse(any('추천 후속 지시' in text for text, _ in self.sender.sent))
+
+    def test_cancelled_turn_does_not_report_a_backend_failure(self):
+        self.rpc.on_start = lambda: self.engine.completed.update({'turn-1': {'id': 'turn-1', 'status': 'interrupted'}})
+        job = self.store.enqueue_job(json.dumps({'kind': 'chat', 'text': 'synthetic'}), 'interrupted')
+        self.engine.run_job(self.store.job(job))
+        self.assertEqual(self.store.job(job)['status'], 'cancelled')
+        self.assertIsNone(self.store.get('last_failure'))
+
+    def test_expired_callback_ack_does_not_fail_authorized_action_delivery(self):
+        class FakeTelegram:
+            def call(self, method, payload):
+                if method == 'answerCallbackQuery':
+                    raise TelegramError(400, 'Bad Request: query is too old and response timeout expired or query ID is invalid')
+                return {'message_id': 1}
+        stop = threading.Event()
+        sender = Sender(FakeTelegram(), self.store, self.config, stop, self.redact)
+        self.store.queue('answerCallbackQuery', {'callback_query_id': 'expired'}, 0)
+        sender.thread.start()
+        try:
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                with self.store.lock: status = self.store.db.execute('SELECT status FROM outbox').fetchone()[0]
+                if status == 'delivered': break
+                time.sleep(.02)
+            self.assertEqual(status, 'delivered')
+        finally:
+            stop.set();sender.thread.join(1)
 
     def test_unregistered_extra_directory_is_rejected(self):
         self.config.add_dirs = (str(self.root.parent / 'unregistered-root'),)

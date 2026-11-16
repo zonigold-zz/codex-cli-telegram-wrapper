@@ -120,6 +120,12 @@ class Sender:
                 self.store.set("last_send_ok", time.time())
             except TelegramError as exc:
                 text = self.redact(exc)
+                if row["kind"] == "answerCallbackQuery" and exc.code == 400 and (
+                        "query is too old" in text.lower() or "query id is invalid" in text.lower()):
+                    # Expired acknowledgement does not invalidate the authorized button action.
+                    self.store.outbound_done(row)
+                    self.store.audit("expired_callback_ack", {})
+                    continue
                 if exc.code == 400 and "message is not modified" in text.lower():
                     self.store.outbound_done(row)
                     continue
