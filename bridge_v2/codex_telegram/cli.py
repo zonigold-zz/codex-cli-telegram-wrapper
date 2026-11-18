@@ -25,6 +25,7 @@ def main():
     parser.add_argument("--tg-stop", action="store_true")
     parser.add_argument("--tg-health", action="store_true")
     parser.add_argument("--tg-check-config", action="store_true")
+    parser.add_argument("--tg-setup", action="store_true", help="Prepare the isolated CLI home and its existing Windows sandbox mode")
     parser.add_argument("--tg-max-hours", type=float)
     parser.add_argument("--tg-max-turns", type=int)
     parser.add_argument("--tg-max-tokens", type=int, default=200000)
@@ -53,7 +54,7 @@ def main():
             return 1
         store = Store(database)
         print(json.dumps({k: store.get(k) for k in ("version", "runtime_status", "pid", "heartbeat",
-                          "last_poll_ok", "last_send_ok", "poll_error", "codex_thread", "auto_mode", "telegram_topic")}, ensure_ascii=False))
+                          "last_poll_ok", "last_send_ok", "poll_error", "codex_thread", "codex_home", "auto_mode", "telegram_topic")}, ensure_ascii=False))
         store.close()
         return 0
     try:
@@ -80,6 +81,17 @@ def main():
             raise ValueError("실행 한도 또는 승인 검토 설정이 잘못됐습니다.")
         if args.tg_check_config:
             print(json.dumps(config.public(), ensure_ascii=False))
+            return 0
+        if args.tg_setup:
+            from .rpc import AppServer
+            from .runtime import InstanceLock
+            with InstanceLock(config.bot_key):
+                rpc = AppServer(config, redact)
+                try:
+                    rpc.start(setup_sandbox=True)
+                    print("독립 CLI 저장소와 보안 실행 준비를 확인했습니다.")
+                finally:
+                    rpc.close()
             return 0
         return serve(config, redact)
     except (ValueError, RuntimeError, OSError) as exc:

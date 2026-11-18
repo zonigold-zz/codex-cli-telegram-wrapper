@@ -186,6 +186,8 @@ def serve(config, redact):
                 return 0
             bootstrap_topic(tg, store, config)
             rpc.start()
+            from .migration import migrate_conversation
+            migrate_conversation(config, store, rpc)
             engine.validate_add_dirs()
             catalog = engine.models()
             store.set("model_catalog", catalog)

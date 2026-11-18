@@ -86,8 +86,12 @@ class Config:
     def bot_key(self) -> str:
         return hashlib.sha256(self.token.encode()).hexdigest()[:24]
 
+    @property
+    def codex_home(self) -> Path:
+        return self.state_dir / "codex-home"
+
     def public(self) -> dict:
-        return {"workdir": str(self.workdir), "state_dir": str(self.state_dir),
+        return {"workdir": str(self.workdir), "state_dir": str(self.state_dir), "codex_home": str(self.codex_home),
                 "model": self.model, "effort": self.effort, "approval_policy": self.approval_policy,
                 "add_dirs": self.add_dirs, "forwarded_env_names": sorted(self.child_env)}
 

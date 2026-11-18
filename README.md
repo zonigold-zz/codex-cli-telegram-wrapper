@@ -1,8 +1,8 @@
-# Codex CLI Telegram Wrapper v2.0.2
+# Codex CLI Telegram Wrapper v2.1.0
 
 Codex CLI의 app-server를 사용하는 단일 운영자용 Telegram 클라이언트입니다.
 기존 Codex 로그인과 프로젝트 권한을 사용하며, 별도 OpenAI API 키는 필요하지 않습니다.
-Windows, Codex CLI 0.166.0, Python 3.11/3.13에서 검증했습니다. Python 3.10+가 필요합니다.
+Windows, Codex CLI 0.166.0, Python 3.11/3.13에서 검증했습니다. Python 3.11+가 필요합니다.
 
 ## 시작하기
 
@@ -111,7 +111,7 @@ python -B -m unittest discover -s .\bridge_v2\tests -v
 ```
 
 제한된 Windows 환경에서는 `CODEX_TG_TEST_TMPDIR`에 쓰기 가능한 시험 폴더를 지정합니다.
-104개 검사는 네트워크나 모델 호출 없이 상태 복구, 권한, 재시도, 계획, 취소,
+150개 검사는 네트워크나 모델 호출 없이 상태 복구, 권한, 재시도, 계획, 취소,
 가짜 app-server와의 파이프 통신, 모델 도움말과 잘못된 입력 처리를 확인합니다.
 
 공식 규격: [Codex app-server](https://learn.chatgpt.com/docs/app-server)
@@ -132,3 +132,38 @@ python -B -m unittest discover -s .\bridge_v2\tests -v
 
 실제 검증에는 대화 점유 충돌 복구, 제안 버튼 생성·실행, 모델 변경, 생성된 2단계 계획의
 자동 실행과 검증 명령, 중단·재시작, 읽기 전용 및 원본·비밀 파일 차단을 포함했습니다.
+
+## v2.1.0: Telegram과 데스크톱 대화 분리
+
+각 봇의 상태 폴더 아래 `codex-home/`을 독립적인 `CODEX_HOME`으로 사용합니다.
+SQLite 저장소와 로그 경로도 해당 홈으로 고정합니다. 데스크톱 앱의 대화 저장소,
+MCP/앱 도구, 알림 명령, 원격 제어와 연결하지 않습니다. 하위 Codex 작업도 같은
+독립 홈을 상속합니다. 프로젝트 설정이 MCP를 다시 켜면 시작을 중단합니다.
+
+최초 준비 시 기존 로그인, 공통 지시, 프로젝트·보안 설정, 승인 규칙과 CLI용
+autoresearch 스킬을 복사합니다. 다른 데스크톱 대화나 DB 전체는 복사하지 않습니다.
+이후 인증 파일을 덮어쓰지 않으며, 승인 규칙 스냅샷이 변경되면 검토·병합을 요구합니다.
+기존 브릿지에서 이전할 때는 같은 프로젝트의 브릿지 소유 대화 하나만 복사하고,
+마지막으로 완료된 브릿지 턴까지 이력을 보존한 새 독립 대화로 전환합니다.
+원래 대화는 삭제하지 않으며, 이전 자체가 모델 작업을 시작하지 않습니다.
+
+Windows 최초 준비는 **진행 중인 작업을 완료하고 브릿지를 종료한 후** 수행합니다.
+
+```powershell
+.\codex-tg.cmd --tg-setup --tg-workdir "C:\Projects\my-project"
+.\codex-tg.cmd --tg-workdir "C:\Projects\my-project"
+```
+
+기존과 같은 Windows 보안 실행 모드를 유지하며, 준비 상태를 먼저 조회해 이미
+완료된 설정의 관리자 확인을 반복 요청하지 않습니다. 준비가 안 됐거나 원격 제어
+차단을 확인하지 못하면 공유 저장소로 우회하지 않고 시작을 중단합니다.
+실행 중인 봇과 같은 토큰으로 `--tg-setup`을 동시에 실행할 수 없습니다.
+
+`codex-home/`에는 로그인·대화·보안 실행 캐시가 있으므로 커밋하지 마세요.
+여러 관리자 확인이 표시돼도 각각 별도 Windows VM이 생기는 것은 아닙니다.
+`codex sandbox uninstall`은 공용 계정·서비스·네트워크 규칙을 제거할 수 있으므로
+시험용 폴더 정리에 사용하지 마세요.
+
+추가 검증: 두 Python 환경의 150개 검사(Windows 심볼릭 링크 생성 1개는 권한상
+생략하되 모의 차단 검사는 실행), 독립 홈에서의 실제 기능 시험, 실제 Telegram
+제안 처리, 새 대화 ID의 데스크톱 DB 미등록 및 원격 제어·MCP 차단 확인.

@@ -5,7 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 from codex_telegram.config import Config, Redactor
 from codex_telegram.rpc import AppServer, RPCError
@@ -25,7 +25,21 @@ for line in sys.stdin:
     if method == 'test/approval':
         print(json.dumps({'id': 9000, 'method': 'item/commandExecution/requestApproval',
                           'params': {'threadId': 'thread-1', 'turnId': 'turn-1'}}), flush=True)
-    if method == 'test/project-env':
+    if method == 'remoteControl/status/read':
+        result = {'status':os.environ.get('FAKE_REMOTE_STATUS','disabled')}
+    elif method == 'windowsSandbox/readiness':
+        result = {'status':os.environ.get('FAKE_SANDBOX_STATUS','ready')}
+    elif method == 'windowsSandbox/setupStart':
+        os.environ['FAKE_SANDBOX_STATUS']='ready'
+        result = {'started':True}
+    elif method == 'config/read':
+        if os.environ.get('FAKE_PREFLIGHT_ERROR'):
+            print(json.dumps({'id':message['id'],'error':{'code':-32000,'message':'preflight unavailable'}}),flush=True)
+            continue
+        result = {'config':{'mcp_servers':{'project_desktop':{}}} if os.environ.get('FAKE_PROJECT_MCP') else {'windows':{'sandbox':'elevated'}}}
+    elif method == 'test/home':
+        result = {'home':os.environ.get('CODEX_HOME')}
+    elif method == 'test/project-env':
         result = {'license': os.environ.get('FS_LICENSE'), 'bot': 'TELEGRAM_BOT_TOKEN' in os.environ}
     elif method == 'test/env':
         result = {key: key in os.environ for key in ['TELEGRAM_BOT_TOKEN', 'CODEX_TG_TEST_SECRET']}
@@ -50,6 +64,8 @@ class RPCTests(unittest.TestCase):
         def launch(command, **kwargs):
             return self.original_popen([sys.executable, '-X', 'utf8', '-B', '-u', str(self.fixture)], **kwargs)
         self.patches = [patch('codex_telegram.rpc.codex_executable', return_value=sys.executable),
+                        patch('codex_telegram.rpc.disable_remote_control'),
+                        patch('codex_telegram.rpc.prepare_home', side_effect=lambda cfg: (cfg.codex_home.mkdir(parents=True, exist_ok=True), cfg.codex_home)[1]),
                         patch('codex_telegram.rpc.subprocess.Popen', side_effect=launch)]
         for item in self.patches: item.start()
         self.rpc.start()
@@ -76,6 +92,63 @@ class RPCTests(unittest.TestCase):
         self.assertIn('already has an active writer', str(caught.exception))
         self.assertNotIn('synthetic-token', str(caught.exception))
         self.assertEqual(self.rpc.pending, {})
+
+    def test_rpc_uses_its_own_home_even_when_parent_points_to_desktop(self):
+        self.assertEqual(self.rpc.request('test/home',{})['home'],str(self.cfg.codex_home.resolve()))
+
+    def test_remote_control_enabled_fails_before_any_conversation(self):
+        self.rpc.close()
+        with patch.dict(os.environ,{'FAKE_REMOTE_STATUS':'enabled'}):
+            with self.assertRaisesRegex(RPCError,'원격 제어'):
+                self.rpc.start()
+        self.assertFalse(self.rpc.alive)
+
+    def test_project_config_cannot_reintroduce_desktop_mcp(self):
+        self.rpc.close()
+        with patch.dict(os.environ,{'FAKE_PROJECT_MCP':'1'}):
+            with self.assertRaisesRegex(RPCError,'MCP'):
+                self.rpc.start()
+        self.assertFalse(self.rpc.alive)
+
+    def test_failed_preflight_cannot_leave_a_reusable_unverified_process(self):
+        self.rpc.close()
+        with patch.dict(os.environ,{'FAKE_PREFLIGHT_ERROR':'1'}):
+            with self.assertRaisesRegex(RPCError,'preflight unavailable'):
+                self.rpc.start()
+        self.assertFalse(self.rpc.alive)
+        self.assertFalse(self.rpc.ready)
+        failed_generation=self.rpc.generation
+        self.rpc.start()
+        self.assertTrue(self.rpc.ready)
+        self.assertGreater(self.rpc.generation,failed_generation)
+
+    @unittest.skipUnless(os.name=='nt','Windows sandbox preflight')
+    def test_missing_windows_setup_does_not_hang_thread_creation_or_weaken_permissions(self):
+        self.rpc.close()
+        with patch.dict(os.environ,{'FAKE_SANDBOX_STATUS':'updateRequired'}):
+            with self.assertRaisesRegex(RPCError,'--tg-setup'):
+                self.rpc.start()
+        self.assertFalse(self.rpc.alive)
+
+    @unittest.skipUnless(os.name=='nt','Windows setup readiness')
+    def test_successful_setup_without_notification_does_not_request_elevation_again(self):
+        self.rpc.close()
+        with patch.dict(os.environ,{'FAKE_SANDBOX_STATUS':'updateRequired'}):
+            self.rpc.start(setup_sandbox=True)
+        self.assertTrue(self.rpc.ready)
+        generation=self.rpc.generation
+        self.rpc.start()
+        self.assertEqual(self.rpc.generation,generation)
+
+    def test_close_does_not_block_on_a_reader_with_inherited_pipe(self):
+        self.rpc.close()
+        proc=Mock();proc.poll.return_value=0
+        readers=[Mock(),Mock()]
+        for reader in readers:reader.is_alive.return_value=True
+        with patch.object(self.rpc,'proc',proc),patch.object(self.rpc,'reader_threads',readers):
+            self.rpc.close()
+        proc.stdout.close.assert_not_called()
+        proc.stderr.close.assert_not_called()
 
     def test_disconnect_fails_pending_request(self):
         with self.assertRaises(RPCError):

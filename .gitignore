@@ -20,3 +20,8 @@ state/
 data/
 raw/
 outputs/
+
+# Isolated CLI credentials, history and sandbox caches
+codex-home/
+auth.json
+.sandbox*/

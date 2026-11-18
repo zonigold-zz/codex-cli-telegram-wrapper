@@ -23,6 +23,8 @@ Use already supplied information and existing authorization; avoid repeated conf
 Stay within the approved goal and scope. A denied permission is not a workflow question.
 Report genuine blockers honestly. Do not run extra work after completion or user cancellation.
 For planning-only requests, return the requested plan without implementing it.
+Keep conversations and child Codex processes in the current bridge-owned CODEX_HOME.
+Do not connect to desktop-app IPC or create/manage the user's Codex desktop chats.
 """
 
 
@@ -552,6 +554,7 @@ class Engine:
         failure = self.store.get("last_failure")
         failure_text = (f"\n최근 실패: {failure['job']} · {failure['reason'][:700]}" if failure else "")
         self.say(f"Codex Bridge v2\n프로젝트: {self.config.workdir}\n"
+                 "실행 환경: 독립 로컬 CLI · Telegram 전용\n"
                  f"현재 작업: {self.active_job or '대기'}\n현재 모델: {self.active_model or '대기'}\n"
                  f"다음 모델: {self.selected_model() or '기본값'}\n"
                  f"추론 강도: {self.store.get('effort', self.config.effort) or '기본값'}\n"
