@@ -71,7 +71,7 @@ class Config:
     suffix: str = ""
     codex_bin: str = "codex"
     add_dirs: tuple[str, ...] = ()
-    approval_policy: str = "on-request"
+    approval_policy: str = "never"
     reviewer: str = "user"
     max_run_seconds: float = 10800
     max_auto_turns: int = 8

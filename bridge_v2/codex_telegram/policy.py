@@ -80,6 +80,14 @@ def sensitive_question(text):
                           r"권한|승인|설치|업로드|다운로드|삭제|커밋|결제", text, re.I))
 
 
+def permission_question(text):
+    """Recognize permission-consent questions, not general business inputs."""
+    context = r"sandbox|샌드박스|\buac\b|administrator|관리자|permission|권한|elevat\w*|승격|network access|네트워크 접근"
+    consent = r"allow|approv\w*|grant|consent|허용|승인|부여"
+    return bool(re.search(r"(?:" + context + r").{0,160}(?:" + consent + r")|(?:" + consent
+                          + r").{0,160}(?:" + context + r")", text, re.I | re.S))
+
+
 def step_prompt(plan, index):
     step = plan["steps"][index]
     return (f"승인된 계획의 {index + 1}/{len(plan['steps'])}단계를 수행하세요.\n"
@@ -92,6 +100,8 @@ def step_prompt(plan, index):
             "기존 AGENTS.md, 원본 보호, 실제 권한 및 사용자 중단을 따르세요. "
             "새 권한이나 계획 밖 결정을 임의로 승인하지 마세요. "
             "현재 단계가 완료됐으면 step_done, 계속 작업할 수 있으면 continue, "
-            "진짜 사용자 정보·권한이 필요하면 needs_input 또는 needs_approval, "
+            "진짜 사용자 정보가 필요하면 needs_input, "
+            "권한 부족은 승인 질문으로 돌리지 말고 기존 권한 안의 대안을 먼저 찾으세요. "
+            "권한을 확대하지 않고 해결할 수 없으면 구체적인 차단 원인을 적고 blocked, "
             "해결할 수 없는 문제가 있으면 blocked로 반환하세요. "
             "evidence에는 실제 결과와 검증 근거를 적으세요.")

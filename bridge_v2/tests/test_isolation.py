@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from codex_telegram.isolation import MARKER, disable_remote_control, filtered_config, isolated_environment, prepare_home
+from codex_telegram.isolation import MARKER, disable_remote_control, filtered_config, headless_config, isolated_environment, prepare_home
 
 
 class IsolationTests(unittest.TestCase):
@@ -100,7 +100,9 @@ enabled=false
         (self.desktop / 'auth.json').write_text('another-desktop-token')
         prepare_home(self.config, source_home=self.desktop)
         self.assertEqual((home/'auth.json').read_text(),'refreshed-synthetic-token')
-        self.assertEqual((home/'config.toml').read_text(),'model="two"')
+        current=tomllib.loads((home/'config.toml').read_text())
+        self.assertEqual(current['model'],'two')
+        self.assertEqual(current['approval_policy'],'never')
 
     def test_preexisting_credentials_are_never_replaced(self):
         self.config.codex_home.mkdir(parents=True)
@@ -108,6 +110,49 @@ enabled=false
         (self.desktop/'auth.json').write_text('desktop-synthetic')
         prepare_home(self.config, source_home=self.desktop)
         self.assertEqual((self.config.codex_home/'auth.json').read_text(),'existing-synthetic')
+
+    def test_child_cli_profiles_keep_permission_limits_without_elevation(self):
+        original='''approval_policy="on-request"
+default_permissions="protected"
+[windows]
+sandbox="elevated"
+[permissions.protected]
+extends=":workspace"
+[permissions.protected.filesystem.":workspace_roots"]
+"."="write"
+".env"="deny"
+"raw"="read"
+[permissions.protected.network]
+enabled=false
+[profiles.nested]
+approval_policy="on-request"
+[profiles.nested.windows]
+sandbox="elevated"
+'''
+        source=tomllib.loads(original)
+        result=tomllib.loads(headless_config(original,windows=True))
+        self.assertEqual(result['windows']['sandbox'],'mxc')
+        self.assertEqual(result['profiles']['nested']['windows']['sandbox'],'mxc')
+        self.assertEqual(result['approval_policy'],'never')
+        self.assertEqual(result['profiles']['nested']['approval_policy'],'never')
+        self.assertEqual(result['permissions'],source['permissions'])
+        self.assertEqual(result['default_permissions'],source['default_permissions'])
+        self.assertEqual(tomllib.loads(headless_config(headless_config(original,windows=True),windows=True)),result)
+
+    def test_non_windows_headless_config_does_not_select_windows_backend(self):
+        result=tomllib.loads(headless_config('model="synthetic"',windows=False))
+        self.assertEqual(result,{'model':'synthetic','approval_policy':'never'})
+
+    def test_legacy_private_home_is_upgraded_without_touching_desktop(self):
+        original='model="synthetic"\n[windows]\nsandbox="elevated"\n'
+        (self.desktop/'config.toml').write_text(original)
+        home=prepare_home(self.config,source_home=self.desktop)
+        (home/'config.toml').write_text(original)
+        prepare_home(self.config,source_home=self.desktop)
+        result=tomllib.loads((home/'config.toml').read_text())
+        self.assertEqual(result['windows']['sandbox'],'mxc' if os.name=='nt' else 'elevated')
+        self.assertEqual(result['approval_policy'],'never')
+        self.assertEqual((self.desktop/'config.toml').read_text(),original)
 
     def test_default_shared_home_and_nested_home_are_rejected(self):
         for target in (self.desktop, self.desktop/'bridge-home', self.desktop.parent):

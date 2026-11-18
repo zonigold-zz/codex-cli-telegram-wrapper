@@ -13,7 +13,7 @@ import threading
 import time
 
 from .policy import (PLAN_SCHEMA, RESULT_SCHEMA, SUGGEST_SCHEMA, parse_object,
-                     plan_hash, routine_question, sensitive_question, step_prompt, validate_plan)
+                     permission_question, plan_hash, routine_question, sensitive_question, step_prompt, validate_plan)
 from .rpc import RPCError
 
 
@@ -21,10 +21,14 @@ BRIDGE_INSTRUCTIONS = """You are Codex, accessed through a single-operator Teleg
 Follow the user's instructions, project AGENTS.md, data protections, and actual permission decisions.
 Use already supplied information and existing authorization; avoid repeated confirmation questions.
 Stay within the approved goal and scope. A denied permission is not a workflow question.
+Execute within configured permissions without requesting elevated access or asking for permission changes.
+If an operation is denied, use an allowed alternative or report the concrete blocker.
 Report genuine blockers honestly. Do not run extra work after completion or user cancellation.
 For planning-only requests, return the requested plan without implementing it.
 Keep conversations and child Codex processes in the current bridge-owned CODEX_HOME.
 Do not connect to desktop-app IPC or create/manage the user's Codex desktop chats.
+On Windows MXC, keep long-running commands in foreground tool or PTY sessions and poll them until completion.
+Do not detach a child with Start-Process or Popen and then exit its foreground command; MXC ends that child's lifetime.
 """
 
 
@@ -130,8 +134,11 @@ class Engine:
                 raise ValueError("추가 폴더가 기존 프로젝트 권한에 등록되지 않았습니다: " + requested)
 
     def _thread_options(self, *, temporary=False):
-        result = {"cwd": str(self.config.workdir), "approvalPolicy": self.config.approval_policy,
-                  "approvalsReviewer": self.config.reviewer}
+        # Telegram operation is noninteractive for permissions, including resumed
+        # conversations whose older stored policy allowed interactive approvals.
+        result = {"cwd": str(self.config.workdir), "approvalPolicy": "never",
+                  "approvalsReviewer": self.config.reviewer,
+                  "developerInstructions": BRIDGE_INSTRUCTIONS}
         model = self.selected_model()
         if model:
             result["model"] = model
@@ -164,7 +171,7 @@ class Engine:
                 self.check_thread_scope(saved)
                 result = self.rpc.request("thread/fork", {"threadId": saved, "excludeTurns": True, **options})
             else:
-                result = self.rpc.request("thread/start", {**options, "developerInstructions": BRIDGE_INSTRUCTIONS})
+                result = self.rpc.request("thread/start", options)
             self.active_permission_profile = (result.get("activePermissionProfile") or {}).get("id")
             return result["thread"]["id"]
         if saved and self.loaded_thread == saved and self.loaded_generation == self.rpc.generation:
@@ -178,7 +185,7 @@ class Engine:
                     raise
                 result = self.recover_thread_writer(saved, options)
         else:
-            result = self.rpc.request("thread/start", {**options, "developerInstructions": BRIDGE_INSTRUCTIONS})
+            result = self.rpc.request("thread/start", options)
         thread_id = result["thread"]["id"]
         self.active_permission_profile = (result.get("activePermissionProfile") or {}).get("id")
         if not temporary:
@@ -585,7 +592,10 @@ class Engine:
             if expected_hash and expected_hash != actual_hash:
                 self.say("계획이 변경됐습니다. /plan show에서 다시 확인하세요.")
                 return
-            if self.active_job:
+            if self.store.get("auto_mode") == "running":
+                self.say("자동 진행이 이미 실행 중입니다. 현재 단계와 검증을 이어갑니다.")
+                return
+            if self.active_job and not self.completed_draft_ready(actual_hash):
                 self.say("현재 작업을 마친 뒤 자동 진행을 시작하세요.")
                 return
             if self.store.get("plan_index", 0) >= len(plan["steps"]):
@@ -600,6 +610,20 @@ class Engine:
             self.store.set("auto_nonce", str(time.time_ns()))
             self._queue_step()
         self.say("검토한 계획과 기존 권한 범위에서 자동 진행을 시작합니다.", priority=0)
+
+    def completed_draft_ready(self, actual_hash):
+        """Only a published, validated draft may still be cleaning up here."""
+        if self.cancel.is_set() or self.stop.is_set():
+            return False
+        job = self.store.job(self.active_job)
+        if not job or job["status"] != "completed":
+            return False
+        try:
+            if json.loads(job["prompt"]).get("kind") != "plan_draft":
+                return False
+            return plan_hash(validate_plan(parse_object(job["result"]))) == actual_hash
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return False
 
     def _queue_step(self, extra=""):
         plan = self.store.get("plan")
@@ -698,12 +722,20 @@ class Engine:
             self.rpc.reject(event["id"], "Request is not for the active bridge turn", event["_generation"])
             return
         request_key = str(event["id"])
+        if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+                      "item/permissions/requestApproval"):
+            self.deny_approval(event)
+            return
         self.pending_requests[request_key] = {"event": event, "answers": {}}
         if method == "item/tool/requestUserInput":
             facts = self.store.get("known_answers", {})
             for question in params.get("questions", []):
                 text = question.get("question", "")
-                if text in facts and not sensitive_question(text):
+                if permission_question(text):
+                    self.pending_requests[request_key]["answers"][question["id"]] = {"answers": [
+                        "추가 권한은 허용하지 않습니다. 기존 권한 범위의 대안을 사용하거나 blocked로 보고하세요."]}
+                    self.store.audit("permission_question_denied_without_prompt", {"request": request_key, "question": question["id"]})
+                elif text in facts and not sensitive_question(text):
                     self.pending_requests[request_key]["answers"][question["id"]] = {"answers": [facts[text]]}
                     self.store.audit("known_answer_reused", {"request": request_key, "question": question["id"]})
                 elif (self.in_approved_step() and routine_question(text)
@@ -716,16 +748,7 @@ class Engine:
                         self.store.audit("planned_continuation_answer", {"request": request_key, "question": question["id"]})
             self._show_questions(request_key)
             return
-        if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
-            buttons = [[self.button("이번 작업 허용", {"type": "approval", "request": request_key, "decision": "accept"}, 1800),
-                        self.button("거부", {"type": "approval", "request": request_key, "decision": "decline"}, 1800)]]
-            self.say("실제 실행 승인 요청\n" + self.redact(params.get("command") or params.get("reason") or method)
-                     + "\n작업 경로: " + str(params.get("cwd", self.config.workdir)), buttons=buttons, priority=0)
-        elif method == "item/permissions/requestApproval":
-            self.say("새 권한 요청\n" + self.redact(json.dumps(params.get("permissions", {}), ensure_ascii=False)), buttons=[[
-                self.button("요청한 권한을 이번 턴에 허용", {"type": "approval", "request": request_key, "decision": "grant"}, 1800),
-                self.button("거부", {"type": "approval", "request": request_key, "decision": "deny"}, 1800)]], priority=0)
-        elif method == "mcpServer/elicitation/request":
+        if method == "mcpServer/elicitation/request":
             url = params.get("url")
             if url:
                 self.say("연결 도구가 브라우저 확인을 요청했습니다.\n" + self.redact(params.get("message", ""))
@@ -740,26 +763,34 @@ class Engine:
             self.pending_requests.pop(request_key, None)
             self.rpc.reject(event["id"], "Unsupported interactive request; no automatic approval", event["_generation"])
 
+    def deny_approval(self, event):
+        """A headless bridge never grants a newly requested permission."""
+        if event["method"] == "item/permissions/requestApproval":
+            result = {"permissions": {}, "scope": "turn"}
+        else:
+            result = {"decision": "decline"}
+        self.rpc.respond(event["id"], result, event["_generation"])
+        self.pending_requests.pop(str(event["id"]), None)
+        self.store.audit("permission_request_denied_without_prompt", {
+            "request": str(event["id"]), "method": event["method"]})
+
     def answer_request(self, action):
         pending = self.pending_requests.get(action["request"])
         if not pending:
             self.say("이 승인 요청은 종료됐거나 만료됐습니다.", priority=0)
             return
-        event, decision = pending["event"], action["decision"]
+        event = pending["event"]
         params = event["params"]
-        if params.get("turnId") != self.active_turn or params.get("threadId") != self.active_thread:
+        if (event.get("_generation") != self.rpc.generation
+                or params.get("turnId") != self.active_turn or params.get("threadId") != self.active_thread):
+            self.pending_requests.pop(action["request"], None)
             self.say("현재 작업과 다른 승인 요청입니다.", priority=0)
             return
-        if event["method"] == "item/permissions/requestApproval":
-            result = {"permissions": params["permissions"] if decision == "grant" else {}, "scope": "turn"}
-        else:
-            if decision not in ("accept", "decline"):
-                return
-            result = {"decision": decision}
-        self.rpc.respond(event["id"], result, event["_generation"])
-        self.pending_requests.pop(action["request"], None)
-        self.store.audit("user_approval_decision", {"request": action["request"], "decision": decision})
-        self.say("승인 응답을 전달했습니다.", priority=0)
+        if event["method"] in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+                               "item/permissions/requestApproval"):
+            # A button rendered by an old runtime cannot restore interactive
+            # authorization or approve a request queued before the upgrade.
+            self.deny_approval(event)
 
     def _show_questions(self, request_key):
         pending = self.pending_requests[request_key]
@@ -893,7 +924,8 @@ class Engine:
                        + json.dumps(context, ensure_ascii=False))
         if self.config.suffix:
             prompt += "\n\n" + self.config.suffix
-        params = {"threadId": self.active_thread, "input": [{"type": "text", "text": prompt}]}
+        params = {"threadId": self.active_thread, "input": [{"type": "text", "text": prompt}],
+                  "approvalPolicy": "never"}
         if self.selected_model():
             params["model"] = self.selected_model()
         effort = self.store.get("effort", self.config.effort)
@@ -936,19 +968,27 @@ class Engine:
         final = next((text for text in reversed(texts) if text.strip()), "")
         if not final:
             raise RPCError("완료 이벤트는 받았지만 최종 답변이 없습니다.")
+        if kind == "plan_draft" and not self.cancel.is_set():
+            plan = validate_plan(parse_object(final))
+            with self.control:
+                if not self.cancel.is_set():
+                    # Publish the validated plan before exposing completion. A
+                    # fast /auto on can then queue its first step while this
+                    # worker finishes unsubscribing the temporary draft thread.
+                    with self.store.transaction():
+                        self.store.set("plan", plan)
+                        self.store.set("plan_index", 0)
+                        self.store.set("approved_plan_hash", None)
+                        self.store.set("auto_mode", "paused")
+                        self.store.update_job(job["id"], status="completed", result=final, finished=time.time())
+                    self.show_plan()
+                    return
         self.store.update_job(job["id"], status="completed", result=final, finished=time.time())
         if self.cancel.is_set():
             self.store.set("auto_mode", "paused")
             self.say(f"작업 {job['id']} 종료를 확인했습니다. 자동 진행은 정지 상태입니다.", priority=0)
             return
-        if kind == "plan_draft":
-            plan = validate_plan(parse_object(final))
-            self.store.set("plan", plan)
-            self.store.set("plan_index", 0)
-            self.store.set("approved_plan_hash", None)
-            self.store.set("auto_mode", "paused")
-            self.show_plan()
-        elif kind == "suggest":
+        if kind == "suggest":
             suggestion = parse_object(final)
             self.say("추천 후속 지시\n" + suggestion["prompt"] + "\n\n" + suggestion["reason"], buttons=[[
                 self.button("실행", {"type": "suggest_execute", "text": suggestion["prompt"]})]])
@@ -1014,8 +1054,16 @@ class Engine:
         elif state == "needs_input" and routine_question(result.get("question", "")):
             extra = "\n현재 단계는 이미 위 계획으로 승인됐습니다. 기존 권한 범위에서 이어서 수행하고 검증하세요."
             self.store.audit("routine_question_resolved", {"job": job["id"], "step": index})
+        elif state == "needs_approval":
+            # Older models/schemas may still return this state. Permission
+            # expansion is unavailable: do not turn it into another allow UI.
+            self.store.set("auto_mode", "blocked")
+            self.store.audit("plan_permission_blocked_without_prompt", {"job": job["id"], "step": index})
+            self.say("기존 권한 범위에서 수행할 수 없어 자동 진행을 멈췄습니다. "
+                     "작업 상태와 진단 기록은 보존했습니다.", priority=0)
+            return
         else:
-            self.store.set("auto_mode", "needs_approval" if state == "needs_approval" else "needs_input" if state == "needs_input" else "blocked")
+            self.store.set("auto_mode", "needs_input" if state == "needs_input" else "blocked")
             self.say("자동 진행 대기\n" + (result.get("question") or summary), priority=0)
             return
         fingerprint = hashlib.sha256(json.dumps({"status": state, "evidence": result.get("evidence", []),

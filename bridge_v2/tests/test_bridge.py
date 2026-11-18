@@ -12,7 +12,7 @@ from unittest.mock import patch
 import requests
 
 from codex_telegram.config import Config, Redactor, load_env, project_environment
-from codex_telegram.engine import Engine
+from codex_telegram.engine import BRIDGE_INSTRUCTIONS, Engine
 from codex_telegram.policy import plan_hash, routine_question, validate_plan
 from codex_telegram.rpc import AppServer, RPCError
 from codex_telegram.runtime import InstanceLock, bootstrap_topic
@@ -239,21 +239,79 @@ class BridgeTests(unittest.TestCase):
         self.engine.answer_request({'request': 'old', 'decision': 'accept'})
         self.assertEqual(self.rpc.responses, [])
 
-    def test_interactive_approval_requires_explicit_user_action(self):
+    def test_unexpected_execution_approvals_are_declined_without_buttons(self):
         self.engine.active_thread, self.engine.active_turn = 't', 'v'
-        self.approval_event = {'id': 12, '_generation': 1, 'method': 'item/commandExecution/requestApproval',
-                  'params': {'threadId': 't', 'turnId': 'v', 'command': 'synthetic command'}}
-        self.engine.on_event(self.approval_event)
-        self.assertEqual(self.rpc.responses, [])
-        self.engine.answer_request({'request': '12', 'decision': 'accept'})
-        self.assertEqual(self.rpc.responses[-1], (12, {'decision': 'accept'}))
+        for method in ('item/commandExecution/requestApproval', 'item/fileChange/requestApproval'):
+            with self.subTest(method=method):
+                self.engine.on_event({'id': 12, '_generation': 1, 'method': method,
+                          'params': {'threadId': 't', 'turnId': 'v', 'command': 'synthetic command'}})
+                self.assertEqual(self.rpc.responses[-1], (12, {'decision': 'decline'}))
+                self.assertEqual(self.engine.pending_requests, {})
+                self.assertEqual(self.sender.sent, [])
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM actions').fetchone()[0], 0)
 
-    def test_permission_denial_grants_nothing(self):
+    def test_permission_request_is_denied_without_prompt_or_grant(self):
         self.engine.active_thread, self.engine.active_turn = 't', 'v'
         self.engine.on_event({'id': 12, '_generation': 1, 'method': 'item/permissions/requestApproval',
                   'params': {'threadId': 't', 'turnId': 'v', 'permissions': {'network': {'enabled': True}}}})
+        self.assertEqual(self.rpc.responses, [(12, {'permissions': {}, 'scope': 'turn'})])
+        self.assertEqual(self.engine.pending_requests, {})
+        self.assertEqual(self.sender.sent, [])
         self.engine.answer_request({'request': '12', 'decision': 'deny'})
         self.assertEqual(self.rpc.responses[-1][1]['permissions'], {})
+
+    def test_old_pending_permission_button_cannot_grant_new_access(self):
+        self.engine.active_thread, self.engine.active_turn = 't', 'v'
+        for method, decision, denied in (
+                ('item/commandExecution/requestApproval', 'accept', {'decision': 'decline'}),
+                ('item/fileChange/requestApproval', 'accept', {'decision': 'decline'}),
+                ('item/permissions/requestApproval', 'grant', {'permissions': {}, 'scope': 'turn'})):
+            with self.subTest(method=method):
+                self.engine.pending_requests['12'] = {'event': {
+                    'id': 12, '_generation': 1, 'method': method, 'params': {
+                        'threadId': 't', 'turnId': 'v', 'permissions': {'network': {'enabled': True}}}}}
+                self.engine.answer_request({'request': '12', 'decision': decision})
+                self.assertEqual(self.rpc.responses[-1], (12, denied))
+                self.assertEqual(self.engine.pending_requests, {})
+                self.assertEqual(self.sender.sent, [])
+
+    def test_old_generation_approval_button_cannot_respond_to_new_backend(self):
+        self.engine.active_thread, self.engine.active_turn = 't', 'v'
+        self.engine.pending_requests['12'] = {'event': {
+            'id': 12, '_generation': 0, 'method': 'item/commandExecution/requestApproval',
+            'params': {'threadId': 't', 'turnId': 'v'}}}
+        self.engine.answer_request({'request': '12', 'decision': 'accept'})
+        self.assertEqual(self.rpc.responses, [])
+        self.assertEqual(self.engine.pending_requests, {})
+
+    def test_headless_thread_policy_replaces_stale_interactive_setting(self):
+        self.assertEqual(self.config.approval_policy, 'never')
+        self.config.approval_policy = 'on-request'
+        self.engine.thread()
+        self.rpc.generation += 1
+        self.engine.thread()
+        self.engine.thread(temporary=True)
+        calls = [(method, params) for method, params in self.rpc.calls
+                 if method in ('thread/start', 'thread/resume', 'thread/fork')]
+        self.assertEqual([method for method, _ in calls], ['thread/start', 'thread/resume', 'thread/fork'])
+        self.assertTrue(all(params['approvalPolicy'] == 'never' for _, params in calls))
+        self.assertTrue(all(params['developerInstructions'] == BRIDGE_INSTRUCTIONS for _, params in calls))
+        self.assertIn('foreground tool or PTY sessions', calls[1][1]['developerInstructions'])
+        self.assertIn('without requesting elevated access', calls[2][1]['developerInstructions'])
+        self.assertEqual(calls[-1][1]['permissions'], ':read-only')
+
+    def test_cached_thread_turn_cannot_restore_interactive_approval(self):
+        self.config.approval_policy = 'on-request'
+        self.store.set('codex_thread', 'saved-thread')
+        self.engine.loaded_thread = 'saved-thread'
+        self.engine.loaded_generation = self.rpc.generation
+        self.engine.enqueue('one', 'test')
+        self.engine.wait_turn = lambda *_: {'id': 'turn-1', 'status': 'completed',
+            'items': [{'type': 'agentMessage', 'text': 'done'}]}
+        self.engine.run_job(self.store.next_job())
+        self.assertFalse(any(method in ('thread/start', 'thread/resume') for method, _ in self.rpc.calls))
+        params = next(params for method, params in self.rpc.calls if method == 'turn/start')
+        self.assertEqual(params['approvalPolicy'], 'never')
 
     def test_known_answer_is_reused_and_audited(self):
         self.store.set('known_answers', {'Which output format?': 'HTML'})
@@ -261,6 +319,33 @@ class BridgeTests(unittest.TestCase):
         self.engine.on_event({'id': 18, '_generation': 1, 'method': 'item/tool/requestUserInput',
           'params': {'threadId': 't', 'turnId': 'v', 'questions': [{'id': 'q1', 'question': 'Which output format?'}]}})
         self.assertEqual(self.rpc.responses[-1][1], {'answers': {'q1': {'answers': ['HTML']}}})
+
+    def test_sandbox_permission_question_is_denied_without_showing_a_prompt(self):
+        question = 'Windows 샌드박스 관리자 권한을 허용할까요?'
+        self.store.set('known_answers', {question: 'yes'})
+        self.engine.active_thread, self.engine.active_turn = 't', 'v'
+        self.engine.on_event({'id': 18, '_generation': 1, 'method': 'item/tool/requestUserInput',
+          'params': {'threadId': 't', 'turnId': 'v', 'questions': [{'id': 'q1', 'question': question}]}})
+        answer = self.rpc.responses[-1][1]['answers']['q1']['answers'][0]
+        self.assertIn('추가 권한은 허용하지 않습니다', answer)
+        self.assertNotEqual(answer, 'yes')
+        self.assertEqual(self.sender.sent, [])
+        self.assertEqual(self.engine.pending_requests, {})
+
+    def test_mixed_permission_and_business_questions_keep_only_business_input(self):
+        self.engine.active_thread, self.engine.active_turn = 't', 'v'
+        self.engine.on_event({'id': 18, '_generation': 1, 'method': 'item/tool/requestUserInput',
+          'params': {'threadId': 't', 'turnId': 'v', 'questions': [
+              {'id': 'permission', 'question': 'May I grant network access permission?'},
+              {'id': 'format', 'question': 'Which output format?', 'options': [{'label': 'HTML'}]}]}})
+        self.assertEqual(self.rpc.responses, [])
+        self.assertEqual(len(self.sender.sent), 1)
+        self.assertIn('Which output format?', self.sender.sent[0][0])
+        self.assertNotIn('network access', self.sender.sent[0][0])
+        self.engine.answer_input({'request': '18', 'question': 'format', 'value': 'HTML'})
+        answers = self.rpc.responses[-1][1]['answers']
+        self.assertEqual(answers['format']['answers'], ['HTML'])
+        self.assertIn('허용하지 않습니다', answers['permission']['answers'][0])
 
     def test_planned_workflow_question_can_continue(self):
         self.approved()
@@ -290,6 +375,56 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.store.get('plan_index'), 1)
         self.assertEqual(json.loads(self.store.next_job()['prompt'])['kind'], 'plan_step')
 
+    def test_auto_can_start_after_draft_completion_before_worker_cleanup(self):
+        old = self.plan()
+        old['scope'] = 'old scope that must not be approved'
+        self.store.set('plan', old)
+        revised = self.plan(2)
+        revised['scope'] = 'new reviewed scope'
+        draft_id = self.engine.enqueue('Draft revised plan', 'draft-ready', 'plan_draft')
+        self.engine.active_job = draft_id
+        self.engine.messages['turn-1'] = [json.dumps(revised)]
+        self.engine.wait_turn = lambda *_: {'id': 'turn-1', 'status': 'completed'}
+
+        def approve_immediately():
+            self.assertEqual(self.store.job(draft_id)['status'], 'completed')
+            self.assertEqual(self.store.get('plan'), revised)
+            self.engine.auto_start(plan_hash(old))
+            self.assertIsNone(self.store.get('approved_plan_hash'))
+            self.engine.auto_start(plan_hash(revised))
+            nonce = self.store.get('auto_nonce')
+            self.engine.auto_start(plan_hash(revised))
+            self.assertEqual(self.store.get('auto_nonce'), nonce)
+
+        self.engine.show_plan = approve_immediately
+        self.engine.run_job(self.store.next_job())
+        self.assertEqual(self.engine.active_job, draft_id)  # Final cleanup has not run.
+        self.assertEqual(self.store.get('auto_mode'), 'running')
+        self.assertEqual(self.store.get('approved_plan_hash'), plan_hash(revised))
+        queued = self.store.next_job()
+        self.assertEqual(json.loads(queued['prompt'])['kind'], 'plan_step')
+        self.assertIn('new reviewed scope', json.loads(queued['prompt'])['text'])
+        self.assertIsNone(self.store.next_job())
+
+    def test_auto_rejects_unfinished_failed_cancelled_foreign_or_stale_drafts(self):
+        plan = self.plan()
+        self.store.set('plan', plan)
+        self.store.set('auto_mode', 'paused')
+        other = {**plan, 'scope': 'unpublished scope'}
+        cases = [('running', 'plan_draft', plan), ('queued', 'plan_draft', plan),
+                 ('failed', 'plan_draft', plan), ('cancelled', 'plan_draft', plan),
+                 ('completed', 'chat', plan), ('completed', 'plan_draft', other),
+                 ('completed', 'plan_draft', {'invalid': 'draft'})]
+        for index, (status, kind, result) in enumerate(cases):
+            with self.subTest(status=status, kind=kind, result=result):
+                job_id = self.store.enqueue_job(json.dumps({'kind': kind, 'text': 'draft'}), f'guard-{index}')
+                self.store.update_job(job_id, status=status, result=json.dumps(result))
+                self.engine.active_job = job_id
+                self.engine.auto_start(plan_hash(plan))
+                self.assertEqual(self.store.get('auto_mode'), 'paused')
+                self.assertIsNone(self.store.get('approved_plan_hash'))
+                self.assertEqual(self.store.db.execute("SELECT count(*) FROM jobs WHERE source LIKE 'auto:%'").fetchone()[0], 0)
+
     def test_failed_acceptance_check_never_advances_step(self):
         self.approved(2)
         self.rpc.check_exit = 1
@@ -297,11 +432,13 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.store.get('plan_index', 0), 0)
         self.assertIsNotNone(self.store.next_job())
 
-    def test_real_approval_pauses_auto(self):
+    def test_permission_blocker_stops_auto_without_asking_to_allow(self):
         self.approved(2)
         self.engine.finish_step({'status': 'needs_approval', 'summary': 'permission required', 'question': '승인 필요'}, {'id': 'fake'})
-        self.assertEqual(self.store.get('auto_mode'), 'needs_approval')
+        self.assertEqual(self.store.get('auto_mode'), 'blocked')
         self.assertIsNone(self.store.next_job())
+        self.assertFalse(any('승인 필요' in text or kwargs.get('buttons') for text, kwargs in self.sender.sent))
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM audit WHERE event='plan_permission_blocked_without_prompt'").fetchone()[0], 1)
 
     def test_plan_mutation_invalidates_prior_approval(self):
         plan = self.approved()

@@ -159,7 +159,7 @@ class MigrationTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):migrate_conversation(self.config,self.store,self.rpc,self.source)
         self.assertEqual(self.store.get('codex_thread'),'owned-thread')
 
-    def test_selected_model_and_current_approval_routing_are_preserved(self):
+    def test_selected_model_and_reviewer_are_preserved_with_noninteractive_policy(self):
         self.store.set('model','selected-model');self.store.set('effort','max')
         self.config.reviewer='auto_review'
         migrate_conversation(self.config,self.store,self.rpc,self.source)
@@ -167,7 +167,7 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(params['model'],'selected-model')
         self.assertEqual(params['config']['model_reasoning_effort'],'max')
         self.assertEqual(params['approvalsReviewer'],'auto_review')
-        self.assertEqual(params['approvalPolicy'],'on-request')
+        self.assertEqual(params['approvalPolicy'],'never')
 
     def test_extended_windows_cwd_prefix_is_normalized(self):
         if os.name!='nt':self.skipTest('Windows path normalization')

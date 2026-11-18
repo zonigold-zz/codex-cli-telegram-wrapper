@@ -15,6 +15,8 @@ SERVER = '''import json, os, sys
 for line in sys.stdin:
     message = json.loads(line)
     method = message.get('method')
+    if os.environ.get('FAKE_METHOD_LOG'):
+        with open(os.environ['FAKE_METHOD_LOG'],'a',encoding='utf-8') as log: print(method,file=log)
     if method == 'initialized': continue
     if method == 'test/timeout': continue
     if method == 'test/exit': break
@@ -36,7 +38,9 @@ for line in sys.stdin:
         if os.environ.get('FAKE_PREFLIGHT_ERROR'):
             print(json.dumps({'id':message['id'],'error':{'code':-32000,'message':'preflight unavailable'}}),flush=True)
             continue
-        result = {'config':{'mcp_servers':{'project_desktop':{}}} if os.environ.get('FAKE_PROJECT_MCP') else {'windows':{'sandbox':'elevated'}}}
+        result = {'config':{'mcp_servers':{'project_desktop':{}}} if os.environ.get('FAKE_PROJECT_MCP') else
+                  {'windows':{'sandbox':os.environ.get('FAKE_SANDBOX_MODE','mxc')},
+                   'approval_policy':os.environ.get('FAKE_APPROVAL_POLICY','never')}}
     elif method == 'test/home':
         result = {'home':os.environ.get('CODEX_HOME')}
     elif method == 'test/project-env':
@@ -59,9 +63,12 @@ class RPCTests(unittest.TestCase):
         self.fixture = self.root / 'fixture.py'
         self.fixture.write_text(SERVER, encoding='utf-8')
         self.cfg = Config(self.root, self.root, 'synthetic-token', 7, -10)
+        self.cfg.child_env['FAKE_METHOD_LOG']=str(self.root/'methods.txt')
         self.rpc = AppServer(self.cfg, Redactor({'TELEGRAM_BOT_TOKEN': 'synthetic-token'}))
         self.original_popen = subprocess.Popen
+        self.commands=[]
         def launch(command, **kwargs):
+            self.commands.append(list(command))
             return self.original_popen([sys.executable, '-X', 'utf8', '-B', '-u', str(self.fixture)], **kwargs)
         self.patches = [patch('codex_telegram.rpc.codex_executable', return_value=sys.executable),
                         patch('codex_telegram.rpc.disable_remote_control'),
@@ -123,22 +130,48 @@ class RPCTests(unittest.TestCase):
         self.assertGreater(self.rpc.generation,failed_generation)
 
     @unittest.skipUnless(os.name=='nt','Windows sandbox preflight')
-    def test_missing_windows_setup_does_not_hang_thread_creation_or_weaken_permissions(self):
+    def test_missing_mxc_readiness_does_not_launch_elevated_setup(self):
         self.rpc.close()
         with patch.dict(os.environ,{'FAKE_SANDBOX_STATUS':'updateRequired'}):
-            with self.assertRaisesRegex(RPCError,'--tg-setup'):
+            with self.assertRaisesRegex(RPCError,'MXC'):
                 self.rpc.start()
         self.assertFalse(self.rpc.alive)
+        methods=(self.root/'methods.txt').read_text().splitlines()
+        self.assertNotIn('windowsSandbox/setupStart',methods)
+        self.assertNotIn('thread/start',methods)
 
     @unittest.skipUnless(os.name=='nt','Windows setup readiness')
-    def test_successful_setup_without_notification_does_not_request_elevation_again(self):
+    def test_explicit_setup_command_cannot_launch_elevated_fallback(self):
         self.rpc.close()
         with patch.dict(os.environ,{'FAKE_SANDBOX_STATUS':'updateRequired'}):
-            self.rpc.start(setup_sandbox=True)
-        self.assertTrue(self.rpc.ready)
-        generation=self.rpc.generation
-        self.rpc.start()
-        self.assertEqual(self.rpc.generation,generation)
+            with self.assertRaisesRegex(RPCError,'MXC'):
+                self.rpc.start(setup_sandbox=True)
+        self.assertFalse(self.rpc.ready)
+        self.assertFalse(self.rpc.alive)
+        self.assertNotIn('windowsSandbox/setupStart',(self.root/'methods.txt').read_text().splitlines())
+
+    @unittest.skipUnless(os.name=='nt','Windows strict MXC selection')
+    def test_backend_cannot_silently_select_legacy_elevation(self):
+        self.rpc.close()
+        with patch.dict(os.environ,{'FAKE_SANDBOX_MODE':'elevated'}):
+            with self.assertRaisesRegex(RPCError,'MXC'):
+                self.rpc.start()
+        self.assertFalse(self.rpc.alive)
+        self.assertNotIn('windowsSandbox/setupStart',(self.root/'methods.txt').read_text().splitlines())
+
+    def test_launcher_pins_headless_approval_and_strict_windows_backend(self):
+        command=self.commands[-1]
+        self.assertIn('approval_policy="never"',command)
+        if os.name=='nt':
+            self.assertIn('windows.sandbox="mxc"',command)
+            self.assertNotIn('features.prefer_mxc=true',command)
+
+    def test_interactive_approval_policy_cannot_reappear_from_configuration(self):
+        self.rpc.close()
+        with patch.dict(os.environ,{'FAKE_APPROVAL_POLICY':'on-request'}):
+            with self.assertRaisesRegex(RPCError,'비대화형'):
+                self.rpc.start()
+        self.assertFalse(self.rpc.alive)
 
     def test_close_does_not_block_on_a_reader_with_inherited_pipe(self):
         self.rpc.close()

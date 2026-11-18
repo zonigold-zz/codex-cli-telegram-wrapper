@@ -127,7 +127,7 @@ def migrate_conversation(config, store, rpc, source_home=None):
             "AND turn_id IS NOT NULL ORDER BY COALESCE(finished,created) DESC,created DESC LIMIT 1", (saved,)).fetchone()
     params = {"path": str(copied), "threadId": saved, "excludeTurns": True,
               "deferGoalContinuation": True, "cwd": str(config.workdir),
-              "approvalPolicy": config.approval_policy, "approvalsReviewer": config.reviewer}
+              "approvalPolicy": "never", "approvalsReviewer": config.reviewer}
     model = store.get("model", config.model)
     if model:
         params["model"] = model

@@ -129,6 +129,36 @@ def _check_local_config(path):
         raise RuntimeError("Existing bridge configuration is invalid") from exc
 
 
+def headless_config(content, *, windows):
+    """Pin the non-interactive backend for child CLIs without widening permissions."""
+    if tomllib is None:
+        raise RuntimeError("Isolated bridge configuration requires Python 3.11 or newer")
+    tree = tomllib.loads(content)
+
+    def pin(settings):
+        settings['approval_policy'] = 'never'
+        if windows:
+            settings.setdefault('windows', {})['sandbox'] = 'mxc'
+        for profile in settings.get('profiles', {}).values():
+            pin(profile)
+
+    pin(tree)
+    output = '# Bridge-owned configuration; desktop tools and storage are not shared.\n'
+    output += '\n'.join(json.dumps(key, ensure_ascii=False) + ' = ' + _toml_value(value)
+                        for key, value in tree.items()) + '\n'
+    if tomllib.loads(output) != tree:
+        raise RuntimeError('Headless configuration round-trip mismatch')
+    return output
+
+
+def _pin_headless_config(home):
+    path = home / 'config.toml'
+    original = path.read_text(encoding='utf-8-sig') if path.exists() else ''
+    output = headless_config(original, windows=os.name == 'nt')
+    if not path.exists() or tomllib.loads(original) != tomllib.loads(output):
+        _atomic_write(path, output.encode('utf-8'))
+
+
 def _copy_cli_skill(source, target):
     """Snapshot the existing CLI autoresearch instructions/scripts, never its state."""
     original = source / "skills" / "codex-autoresearch"
@@ -264,6 +294,7 @@ def prepare_home(config, *, source_home=None):
         _copy_cli_skill(source, target)
         _copy_authorization_rules(source, target)
         _validate_rule_snapshot(source, target, expected_rules)
+        _pin_headless_config(target)
         if "source_rules" not in receipt or "rule_source" not in receipt:
             receipt.update(rule_source=str(source.resolve()), source_rules=expected_rules)
             _atomic_write(marker, json.dumps(receipt, ensure_ascii=False).encode("utf-8"))
@@ -288,6 +319,7 @@ def prepare_home(config, *, source_home=None):
     _copy_cli_skill(source, target)
     _copy_authorization_rules(source, target)
     _validate_rule_snapshot(source, target, expected_rules)
+    _pin_headless_config(target)
     _atomic_write(marker, json.dumps({"version": 1, "home": str(target), "seed_files": copied,
                                      "rule_source": str(source.resolve()), "source_rules": expected_rules},
                                      ensure_ascii=False).encode("utf-8"))

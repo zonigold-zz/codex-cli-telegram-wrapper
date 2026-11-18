@@ -186,6 +186,10 @@ def serve(config, redact):
                 return 0
             bootstrap_topic(tg, store, config)
             rpc.start()
+            execution = rpc.request('config/read', {'cwd': str(config.workdir), 'includeLayers': False})['config']
+            store.set('execution_policy', {'backend': (execution.get('windows') or {}).get('sandbox'),
+                                          'approval_policy': execution.get('approval_policy'),
+                                          'native_pid': rpc.proc.pid, 'validated_at': time.time()})
             from .migration import migrate_conversation
             migrate_conversation(config, store, rpc)
             engine.validate_add_dirs()

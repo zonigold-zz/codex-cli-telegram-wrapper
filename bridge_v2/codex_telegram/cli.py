@@ -25,7 +25,7 @@ def main():
     parser.add_argument("--tg-stop", action="store_true")
     parser.add_argument("--tg-health", action="store_true")
     parser.add_argument("--tg-check-config", action="store_true")
-    parser.add_argument("--tg-setup", action="store_true", help="Prepare the isolated CLI home and its existing Windows sandbox mode")
+    parser.add_argument("--tg-setup", action="store_true", help="Verify the isolated CLI home and non-interactive MXC readiness; never launch elevated setup")
     parser.add_argument("--tg-max-hours", type=float)
     parser.add_argument("--tg-max-turns", type=int)
     parser.add_argument("--tg-max-tokens", type=int, default=200000)
